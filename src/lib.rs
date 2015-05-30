@@ -88,39 +88,31 @@
 //! the pixels in "english reading order": left to right, then top to bottom.
 //!
 //! Unfortunately for us, this data is encoded in a pseudo-LZW-compressed format. How to walk
-//! through that format is explained above. Here's how to decode each block.
+//! through that format is explained above. Decoding it is super complicated though, and I really
+//! don't understand it. This is the one place I basically deferred to GIFLIB's implementation
+//! with occassional cleanups.
 //!
-//! TODO: Read the giflib docs and figure it out
-//!
-//! Recall that we acquired the *minimum code size* from parsing the image data. This is like
-//! the LCT and GCT sizes. Code table has real size 2^k + 2. First 2^k are exactly colour indices,
-//! last 2 are "clear" and "end of information", respectively.
+//! A very minimal GIF
+//! Header:      47 49 46 38 39 61                           - "GIF89a"
+//! LSD:         0A 00 0A 00   91   00   00                  - 91 = 1 001 0 001 - GCT w/ 4 colours
+//! GCT:         FF FF FF   FF 00 00   00 00 FF   00 00 00   - white, red, blue, black
+//! GraphExt:    21 F9   04   00   00 00   00   00           - no animation or transparency
+//! Image:       2C
+//!      desc:   00 00   00 00   0A 00   0A 00   00          - 10x10 img, no LCT, no interlace
+//!      data:   02   16   8C 2D 99 87 2A 1C DC 33 A0 02 75 EC 95 FA A8 DE 60 8C 04 91 4C 01   00
+//!      data block (thing that starts with 8C) in binary:
+//! EOF:         3B
 
-// A very minimal GIF
-// Header:      47 49 46 38 39 61                           - "GIF89a"
-// LSD:         0A 00 0A 00   91   00   00                  - 91 = 1 001 0 001 - GCT w/ 4 colours
-// GCT:         FF FF FF   FF 00 00   00 00 FF   00 00 00   - white, red, blue, black
-// GraphExt:    21 F9   04   00   00 00   00   00           - no animation or transparency
-// Image:       2C
-//      desc:   00 00   00 00   0A 00   0A 00   00          - 10x10 img, no LCT, no interlace
-//      data:   02   16   8C 2D 99 87 2A 1C DC 33 A0 02 75 EC 95 FA A8 DE 60 8C 04 91 4C 01   00
-//      data block (thing that starts with 8C) in binary:
-//      10001100001011011001100110000111001010100001110
-//      01101110000110011101000000000001001110101111011
-//      00100101011111101010101000110111100110000010001
-//      10000000100100100010100110000000001
-//
-//
-//
-//
-//
-// EOF:         3B
+use std::io::Result as IoResult;
+use std::io::ErrorKind::InvalidInput;
+use std::io::{Read, Error};
 
 const HEADER_LEN: usize = 6;
 const GLOBAL_DESCRIPTOR_LEN: usize = 7;
 const LOCAL_DESCRIPTOR_LEN: usize = 9;
 const GRAPHICS_EXTENSION_LEN: usize = 6;
 const APPLICATION_EXTENSION_LEN: usize = 17;
+const MAX_COLOR_TABLE_SIZE: usize = 3 * 256; // 2^8 RGB colours
 
 const BLOCK_EOF: u8       = 0x3B;
 const BLOCK_EXTENSION: u8 = 0x21;
@@ -149,19 +141,18 @@ pub struct Frame {
 }
 
 
-pub fn parse_gif(data: &[u8]) -> Result<Gif, &'static str> {
+pub fn parse_gif<R: Read>(mut data: R) -> IoResult<Gif> {
     // Note: this code frequently creates new "data" variables to represent all the bytes we
     // haven't read yet. This is just more convenient than re-assigning `data` or tracking our
     // position otherwise.
 
     // ~~~~~~~~~ Image Prelude ~~~~~~~~~~
+    let mut buf = [0; HEADER_LEN + GLOBAL_DESCRIPTOR_LEN];
+    try!(read_to_full(&mut data, &mut buf));
 
-    if data.len() < HEADER_LEN + GLOBAL_DESCRIPTOR_LEN { return Err("File too small to be a GIF"); }
+    let (header, descriptor) = buf.split_at(HEADER_LEN);
+    if header != b"GIF87a" && header != b"GIF89a" { return Err(malformed()); }
 
-    let (header, data) = data.split_at(HEADER_LEN);
-    if header != b"GIF87a" && header != b"GIF89a" { return Err("Not a GIF"); }
-
-    let (descriptor, data) = data.split_at(GLOBAL_DESCRIPTOR_LEN);
     let full_width = le_u16(descriptor[0], descriptor[1]) as usize;
     let full_height = le_u16(descriptor[2], descriptor[3]) as usize;
     let gct_mega_field = descriptor[4];
@@ -170,17 +161,18 @@ pub fn parse_gif(data: &[u8]) -> Result<Gif, &'static str> {
     let gct_size_exponent = gct_mega_field & 0b0000_0111;
     let gct_size = 1usize << (gct_size_exponent + 1); // 2^(k+1)
 
-    let (gct, data) = if gct_flag {
-        if data.len() < 3 * gct_size { return Err("Unexpected end of GIF"); }
-        let (gct, data) = data.split_at(3 * gct_size);
-        (Some(gct), data)
+    let mut gct_buf = [0; MAX_COLOR_TABLE_SIZE];
+
+    let gct = if gct_flag {
+        let gct = &mut gct_buf[.. 3 * gct_size];
+        try!(read_to_full(&mut data, gct));
+        Some(gct)
     } else {
-        (None, data)
+        None
     };
 
     // ~~~~~~~~~ Image Body ~~~~~~~~~~~
 
-    let mut temp_data = data;
     let mut transparent_index = None;
     let mut num_iterations = None;
     let mut frame_delay = 0;
@@ -190,9 +182,7 @@ pub fn parse_gif(data: &[u8]) -> Result<Gif, &'static str> {
     let mut height;
 
     loop {
-        let data = temp_data;
-        if data.len() < 1 { return Err("Unexpected end of GIF"); }
-        match data[0] {
+        match try!(read_byte(&mut data)) {
             BLOCK_EOF => {
                 // TODO: check if this was a sane place to stop?
                 return Ok(Gif {
@@ -204,27 +194,16 @@ pub fn parse_gif(data: &[u8]) -> Result<Gif, &'static str> {
             }
             BLOCK_EXTENSION => {
                 // 3 to coalesce some checks we'll have to make in any branch
-                if data.len() < 3 { return Err("Unexpected end of GIF"); }
-                match data[1] {
+                match try!(read_byte(&mut data)) {
                     EXTENSION_PLAIN | EXTENSION_COMMENT => {
                         // This is legacy garbage, but has a variable length so
                         // we need to parse it a bit to get over it.
-                        let mut data = &data[2..];
-                        loop {
-                            let to_skip = data[0] as usize;
-                            if to_skip == 0 { break; }
-                            if data.len() < to_skip + 2 { return Err("Unexpected end of GIF"); }
-                            data = &data[to_skip+1..];
-                        }
-                        temp_data = &data[1..];
+                        try!(skip_blocks(&mut data));
                     }
                     EXTENSION_GRAPHICS => {
                         // Frame delay and transparency settings
-                        let data = &data[2..];
-                        if data.len() < GRAPHICS_EXTENSION_LEN {
-                            return Err("Unexpected end of GIF");
-                        }
-                        let (ext, data) = data.split_at(GRAPHICS_EXTENSION_LEN);
+                        let mut ext = [0; GRAPHICS_EXTENSION_LEN];
+                        try!(read_to_full(&mut data, &mut ext));
 
                         let rendering_mega_field = ext[1];
                         let transparency_flag = (rendering_mega_field & 0b0000_0001) != 0;
@@ -236,33 +215,26 @@ pub fn parse_gif(data: &[u8]) -> Result<Gif, &'static str> {
                         } else {
                             None
                         };
-
-                        temp_data = data;
                     }
                     EXTENSION_APPLICATION => {
                         // NETSCAPE 2.0 Looping Extension
 
-                        let data = &data[2..];
-                        if data.len() < APPLICATION_EXTENSION_LEN {
-                            return Err("Unexpected end of GIF");
-                        }
+                        let mut ext = [0; APPLICATION_EXTENSION_LEN];
+                        try!(read_to_full(&mut data, &mut ext));
 
-                        // TODO: verify this is the desired application extension?
-                        let (ext, data) = data.split_at(APPLICATION_EXTENSION_LEN);
+                        // TODO: Verify this the NETSCAPE 2.0 extension?
 
                         num_iterations = Some(le_u16(ext[14], ext[15]));
-
-                        temp_data = data;
                     }
-                    _ => { return Err("Unknown extension type found"); }
+                    _ => { return Err(Error::new(InvalidInput, "Unknown extension type found")); }
                 }
             }
             BLOCK_IMAGE => {
-                let data = &data[1..];
-                if data.len() < LOCAL_DESCRIPTOR_LEN { return Err("Unexpected end of GIF"); }
-                let (descriptor, data) = data.split_at(LOCAL_DESCRIPTOR_LEN);
-                let x      = le_u16(descriptor[0], descriptor[1]) as usize;
-                let y      = le_u16(descriptor[2], descriptor[3]) as usize;
+                let mut descriptor = [0; LOCAL_DESCRIPTOR_LEN];
+                try!(read_to_full(&mut data, &mut descriptor));
+
+                let x  = le_u16(descriptor[0], descriptor[1]) as usize;
+                let y  = le_u16(descriptor[2], descriptor[3]) as usize;
                 width  = le_u16(descriptor[4], descriptor[5]) as usize;
                 height = le_u16(descriptor[6], descriptor[7]) as usize;
 
@@ -272,17 +244,18 @@ pub fn parse_gif(data: &[u8]) -> Result<Gif, &'static str> {
                 let lct_size_exponent = (lct_mega_field & 0b0000_1110) >> 1;
                 let lct_size = 1usize << (lct_size_exponent + 1); // 2^(k+1)
 
-                let (lct, data) = if lct_flag {
-                    if data.len() < 3 * lct_size { return Err("Unexpected end of GIF"); }
-                    let (lct, data) = data.split_at(3 * lct_size);
-                    (Some(lct), data)
+
+                let mut lct_buf = [0; MAX_COLOR_TABLE_SIZE];
+
+                let lct = if lct_flag {
+                    let lct = &mut lct_buf[.. 3 * lct_size];
+                    try!(read_to_full(&mut data, lct));
+                    Some(lct)
                 } else {
-                    (None, data)
+                    None
                 };
 
-                if data.len() < 2 { return Err("Unexpected end of GIF"); }
-                let minimum_code_size = data[0];
-                let mut data = &data[1..];
+                let minimum_code_size = try!(read_byte(&mut data));
 
                 let mut indices = vec![0; width * height]; //TODO: not this
 
@@ -293,7 +266,8 @@ pub fn parse_gif(data: &[u8]) -> Result<Gif, &'static str> {
                 println!("starting frame decoding: {}", frames.len());
                 println!("x: {}, y: {}, w: {}, h: {}", x, y, width, height);
                 println!("trans: {:?}, interlace: {}", transparent_index, interlace);
-                println!("delay: {}, disposal: {}, iters: {:?}", frame_delay, disposal_method, num_iterations);
+                println!("delay: {}, disposal: {}, iters: {:?}",
+                         frame_delay, disposal_method, num_iterations);
                 println!("lct: {}, gct: {}", lct_flag, gct_flag);
                 */
 
@@ -306,7 +280,9 @@ pub fn parse_gif(data: &[u8]) -> Result<Gif, &'static str> {
                         let mut j = interlaced_offset[i];
                         while j < height {
                             try!(get_line(&mut parse_state,
-                                          &mut indices[j * width..], width, &mut data));
+                                          &mut indices[j * width..],
+                                          width,
+                                          &mut data));
                             j += interlaced_jumps[i];
                         }
                     }
@@ -359,7 +335,7 @@ pub fn parse_gif(data: &[u8]) -> Result<Gif, &'static str> {
                         }
                     }
                     _ => {
-                        return Err("unsupported disposal method");
+                        return Err(Error::new(InvalidInput, "unsupported disposal method"));
                     }
                 };
 
@@ -401,13 +377,12 @@ pub fn parse_gif(data: &[u8]) -> Result<Gif, &'static str> {
                     duration: frame_delay,
                 });
 
-                temp_data = data;
                 transparent_index = None;
                 frame_delay = 0;
                 disposal_method = 0;
             }
             _ => {
-                return Err("unknown block found");
+                return Err(Error::new(InvalidInput, "unknown block found"));
             }
         }
 
@@ -463,32 +438,26 @@ fn create_parse_state(code_size: u8, pixel_count: usize) -> ParseState {
     }
 }
 
-fn get_line(state: &mut ParseState, line: &mut[u8], line_len: usize, data: &mut &[u8])
-        -> Result<(), &'static str> {
+fn get_line<R: Read>(state: &mut ParseState, line: &mut[u8], line_len: usize, data: &mut R)
+        -> IoResult<()> {
     state.pixel_count -= line_len;
     if state.pixel_count > 0xffff0000 {
-        return Err("Gif has too much pixel data");
+        return Err(Error::new(InvalidInput, "Gif has too much pixel data"));
     }
 
     try!(decompress_line(state, line, line_len, data));
 
     if state.pixel_count == 0 {
-        // giflib seems to think there might be more data left after we get here
-        // so skip through the rest.
-        loop {
-            let to_skip = data[0] as usize;
-            if to_skip == 0 { break; }
-            if data.len() < to_skip + 2 { return Err("Unexpected end of GIF"); }
-            *data = &data[to_skip+1..];
-        }
-        *data = &data[1..];
+        // There might be some more data hanging around. Finish walking through
+        // the data section.
+        try!(skip_blocks(data));
     }
 
     Ok(())
 }
 
-fn decompress_line(state: &mut ParseState, line: &mut[u8], line_len: usize, data: &mut &[u8])
-        -> Result<(), &'static str> {
+fn decompress_line<R: Read>(state: &mut ParseState, line: &mut[u8], line_len: usize, data: &mut R)
+        -> IoResult<()> {
     let mut i = 0;
     let mut current_prefix; // This is uninit in dgif
     let &mut ParseState {
@@ -499,7 +468,7 @@ fn decompress_line(state: &mut ParseState, line: &mut[u8], line_len: usize, data
         ..
     } = state;
 
-    if stack_ptr > LZ_MAX_CODE { return Err("Malformed GIF"); }
+    if stack_ptr > LZ_MAX_CODE { return Err(malformed()); }
     while stack_ptr != 0 && i < line_len {
         stack_ptr -= 1;
         line[i] = state.stack[stack_ptr];
@@ -516,7 +485,7 @@ fn decompress_line(state: &mut ParseState, line: &mut[u8], line_len: usize, data
             ..
         } = state;
 
-        if current_code == eof_code { return Err("Unexpected end of GIF"); }
+        if current_code == eof_code { return Err(eof()); }
 
         if current_code == clear_code {
             // Reset all the sweet codez we learned
@@ -574,7 +543,7 @@ fn decompress_line(state: &mut ParseState, line: &mut[u8], line_len: usize, data
                 }
 
                 if stack_ptr >= LZ_MAX_CODE || current_prefix > LZ_MAX_CODE {
-                    return Err("Malformed GIF");
+                    return Err(malformed());
                 }
 
                 stack[stack_ptr] = current_prefix as u8;
@@ -629,7 +598,7 @@ fn get_prefix_char(prefix: &[usize], mut code: usize, clear_code: usize) -> usiz
     return code;
 }
 
-fn decompress_input(state: &mut ParseState, src: &mut &[u8]) -> Result<usize, &'static str> {
+fn decompress_input<R: Read>(state: &mut ParseState, src: &mut R) -> IoResult<usize> {
     let code_masks: [usize; 13] = [
         0x0000, 0x0001, 0x0003, 0x0007,
         0x000f, 0x001f, 0x003f, 0x007f,
@@ -642,19 +611,13 @@ fn decompress_input(state: &mut ParseState, src: &mut &[u8]) -> Result<usize, &'
     while state.current_shift_state < state.running_bits {
         // Get the next byte, which is either in this block or the next one
         let next_byte = if state.buf[0] == 0 {
+
             // This block is done, get the next one
-            let len = src[0] as usize;
+            let len = try!(read_block(src, &mut state.buf[1..]));
             state.buf[0] = len as u8;
 
-            if len == 0 || src.len() <= len { return Err("Unexpected end of GIF"); }
-
-            // Copy next len bytes from src to buf
-            for i in 0..len {
-                state.buf[i + 1] = src[i + 1];
-            }
-
-            // seek ahead
-            *src = &src[len + 1..];
+            // Reaching the end is not expected here
+            if len == 0 { return Err(eof()); }
 
             let next_byte = state.buf[1];
             state.buf[1] = 2;
@@ -688,8 +651,56 @@ fn decompress_input(state: &mut ParseState, src: &mut &[u8]) -> Result<usize, &'
     Ok(code)
 }
 
+fn read_byte<R: Read>(reader: &mut R) -> IoResult<u8> {
+    let mut buf = [0];
+    let bytes_read = try!(reader.read(&mut buf));
+    if bytes_read != 1 { return Err(eof()); }
+    Ok(buf[0])
+}
+
+fn read_to_full<R: Read>(reader: &mut R, buf: &mut [u8]) -> IoResult<()> {
+    let mut read = 0;
+    loop {
+        if read == buf.len() { return Ok(()) }
+
+        let bytes = try!(reader.read(&mut buf[read..]));
+
+        if bytes == 0 { return Err(eof()) }
+
+        read += bytes;
+    }
+}
+
+/// A few places where you need to skip through some variable length region
+/// without evaluating the results. This does that.
+fn skip_blocks<R: Read>(reader: &mut R) -> IoResult<()> {
+    let mut black_hole = [0; 256];
+    loop {
+        let len = try!(read_block(reader, &mut black_hole));
+        if len == 0 { return Ok(()) }
+    }
+}
+
+/// There are several variable length encoded regions in a GIF,
+/// that look like [len, ..len]. This is a convenience for grabbing the next
+/// block. Returns `len`.
+fn read_block<R: Read>(reader: &mut R, buf: &mut [u8]) -> IoResult<usize> {
+    debug_assert!(buf.len() >= 256);
+    let len = try!(read_byte(reader)) as usize;
+    if len == 0 { return Ok(0) } // read_to_full will probably freak out
+    try!(read_to_full(reader, &mut buf[..len]));
+    Ok(len)
+}
+
 fn le_u16(first: u8, second: u8) -> u16 {
     // TODO: verify this; I am bad at endian stuff
     ((second as u16) << 8) | (first as u16)
 }
 
+fn malformed() -> Error {
+    Error::new(InvalidInput, "Malformed GIF")
+}
+
+fn eof() -> Error {
+    Error::new(InvalidInput, "Unexpected end of GIF")
+}

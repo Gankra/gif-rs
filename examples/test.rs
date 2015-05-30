@@ -2,7 +2,7 @@ extern crate gif;
 
 use std::fs::{self, File};
 use std::io::Result as IoResult;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::env;
 
 static OUT_DIR: &'static str = "output";
@@ -19,12 +19,9 @@ fn main() {
 }
 
 fn do_it(path: &str) -> IoResult<()> {
-	let mut file = try!(File::open(path));
+	let file = try!(File::open(path));
 
-	let mut buf = vec![];
-	try!(file.read_to_end(&mut buf));
-
-	let gif = gif::parse_gif(&buf).unwrap();
+	let gif = gif::parse_gif(&file).unwrap();
 
 
     if fs::read_dir(OUT_DIR).is_ok() {
