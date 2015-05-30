@@ -173,10 +173,15 @@ pub fn parse_gif<R: Read>(mut data: R) -> IoResult<Gif> {
 
     // ~~~~~~~~~ Image Body ~~~~~~~~~~~
 
-    let mut transparent_index = None;
+    // global to the whole gif, probably should only be set once (if ever)
     let mut num_iterations = None;
+
+    // local to this frame of the gif, but may be obtained at any time
+    // should be reset when the frame itself is processed.
+    let mut transparent_index = None;
     let mut frame_delay = 0;
     let mut disposal_method = 0;
+
     let mut frames = vec![];
 
     loop {
@@ -288,7 +293,7 @@ pub fn parse_gif<R: Read>(mut data: R) -> IoResult<Gif> {
                     try!(get_line(&mut parse_state, &mut indices, width * height, &mut data));
                 }
 
-                // ~~~~~~~~~~~ MAP THE INDICES TO COLOURS ~~~~~~~~~~~
+                // ~~~~~~~~~~~~~~ INITIALIZE THE BACKGROUND ~~~~~~~~~~~
 
                 let num_bytes = full_width * full_height * 4;
 
@@ -337,21 +342,23 @@ pub fn parse_gif<R: Read>(mut data: R) -> IoResult<Gif> {
                     }
                 };
 
+                // ~~~~~~~~~~~~~~~~~~~ MAP INDICES TO COLORS ~~~~~~~~~~~~~~~~~~
 
                 let color_map = lct.as_ref().unwrap_or_else(|| gct.as_ref().unwrap());
                 for (pix_idx, col_idx) in indices.into_iter().enumerate() {
                     let is_transparent = transparent_index.map(|idx| idx == col_idx)
                                                           .unwrap_or(false);
-                    let (r, g, b, a) = if is_transparent {
-                        continue;
-                        // (0, 0, 0, 0)
-                    } else {
-                        let col_idx = col_idx as usize;
-                        let r = color_map[col_idx * 3 + 0];
-                        let g = color_map[col_idx * 3 + 1];
-                        let b = color_map[col_idx * 3 + 2];
-                        (r, g, b, 0xFF)
-                    };
+
+                    // A transparent pixel "shows through" to whatever pixels
+                    // were drawn before. True transparency can only be set
+                    // in the disposal phase, as far as I can tell.
+                    if is_transparent { continue; }
+
+                    let col_idx = col_idx as usize;
+                    let r = color_map[col_idx * 3 + 0];
+                    let g = color_map[col_idx * 3 + 1];
+                    let b = color_map[col_idx * 3 + 2];
+                    let a = 0xFF;
 
                     // we're blitting this frame on top of some perhaps larger
                     // canvas. We need to adjust accordingly.
@@ -368,13 +375,15 @@ pub fn parse_gif<R: Read>(mut data: R) -> IoResult<Gif> {
                     pixels[pix_idx * 4 + 2] = b;
                     pixels[pix_idx * 4 + 3] = a;
                 }
-                // TODO: use the processed data (disposal method, etc)
+
+                // ~~~~~~~~~~~~~~~~~~ DONE!!! ~~~~~~~~~~~~~~~~~~~~
 
                 frames.push(Frame {
                     data: pixels,
                     duration: frame_delay,
                 });
 
+                // Reset frame-locals
                 transparent_index = None;
                 frame_delay = 0;
                 disposal_method = 0;
@@ -383,15 +392,16 @@ pub fn parse_gif<R: Read>(mut data: R) -> IoResult<Gif> {
                 return Err(Error::new(InvalidInput, "unknown block found"));
             }
         }
-
     }
 }
 
 
+// ~~~~~~~~~~~~~~~~~ utilities for decoding LZW data ~~~~~~~~~~~~~~~~~~~
+
 const LZ_MAX_CODE: usize = 4095;
 const LZ_BITS: usize = 12;
 
-const NO_SUCH_CODE: usize = 4098;    /* Impossible code, to signal empty. */
+const NO_SUCH_CODE: usize = 4098;    // Impossible code, to signal empty.
 
 struct ParseState {
     bits_per_pixel: usize,
@@ -504,32 +514,23 @@ fn decompress_line<R: Read>(state: &mut ParseState, line: &mut[u8], line_len: us
                 i += 1;
             } else {
                 // MULTI-CODE MULTI-CODE ENGAGE -- DASH DASH DASH!!!!
+
                 if prefix[current_code] == NO_SUCH_CODE {
                     current_prefix = last_code;
 
-                    // VIA DGIF:
-                    /* Only allowed if CrntCode is exactly the running code:
-                     * In that case CrntCode = XXXCode, CrntCode or the
-                     * prefix code is last code and the suffix char is
-                     * exactly the prefix of last code! */
                     let code = if current_code == state.running_code - 2 {
                         last_code
                     } else {
                         current_code
                     };
 
-                    let prefix_char = get_prefix_char(&*prefix, code, clear_code) as u8;
+                    let prefix_char = get_prefix_char(&*prefix, code, clear_code);
                     stack[stack_ptr] = prefix_char;
                     suffix[state.running_code - 2] = prefix_char;
                     stack_ptr += 1;
                 } else {
                     current_prefix = current_code;
                 }
-
-                /* Now (if image is O.K.) we should not get a NO_SUCH_CODE
-                 * during the trace. As we might loop forever, in case of
-                 * defective image, we use StackPtr as loop counter and stop
-                 * before overflowing Stack[]. */
 
                 while stack_ptr < LZ_MAX_CODE
                         && current_prefix > clear_code
@@ -559,16 +560,12 @@ fn decompress_line<R: Read>(state: &mut ParseState, line: &mut[u8], line_len: us
                 prefix[state.running_code - 2] = last_code;
 
                 let code = if current_code == state.running_code - 2 {
-                    /* Only allowed if CrntCode is exactly the running code:
-                     * In that case CrntCode = XXXCode, CrntCode or the
-                     * prefix code is last code and the suffix char is
-                     * exactly the prefix of last code! */
                     last_code
                 } else {
                     current_code
                 };
 
-                suffix[state.running_code - 2] = get_prefix_char(&*prefix, code, clear_code) as u8;
+                suffix[state.running_code - 2] = get_prefix_char(&*prefix, code, clear_code);
             }
 
             last_code = current_code;
@@ -582,18 +579,18 @@ fn decompress_line<R: Read>(state: &mut ParseState, line: &mut[u8], line_len: us
 }
 
 // Prefix is a virtual linked list or something.
-fn get_prefix_char(prefix: &[usize], mut code: usize, clear_code: usize) -> usize {
+fn get_prefix_char(prefix: &[usize], mut code: usize, clear_code: usize) -> u8 {
     let mut i = 0;
 
     loop {
         if code <= clear_code { break; }
         i += 1;
         if i > LZ_MAX_CODE { break; }
-        if code > LZ_MAX_CODE { return NO_SUCH_CODE; }
+        if code > LZ_MAX_CODE { return NO_SUCH_CODE as u8; }
         code = prefix[code];
     }
 
-    return code;
+    code as u8
 }
 
 fn decompress_input<R: Read>(state: &mut ParseState, src: &mut R) -> IoResult<usize> {
@@ -649,6 +646,9 @@ fn decompress_input<R: Read>(state: &mut ParseState, src: &mut R) -> IoResult<us
     Ok(code)
 }
 
+
+// ~~~~~~~~~~~~ Streaming reading utils ~~~~~~~~~~~~~~~
+
 fn read_byte<R: Read>(reader: &mut R) -> IoResult<u8> {
     let mut buf = [0];
     let bytes_read = try!(reader.read(&mut buf));
@@ -672,7 +672,7 @@ fn read_to_full<R: Read>(reader: &mut R, buf: &mut [u8]) -> IoResult<()> {
 /// A few places where you need to skip through some variable length region
 /// without evaluating the results. This does that.
 fn skip_blocks<R: Read>(reader: &mut R) -> IoResult<()> {
-    let mut black_hole = [0; 256];
+    let mut black_hole = [0; 255];
     loop {
         let len = try!(read_block(reader, &mut black_hole));
         if len == 0 { return Ok(()) }
@@ -683,7 +683,7 @@ fn skip_blocks<R: Read>(reader: &mut R) -> IoResult<()> {
 /// that look like [len, ..len]. This is a convenience for grabbing the next
 /// block. Returns `len`.
 fn read_block<R: Read>(reader: &mut R, buf: &mut [u8]) -> IoResult<usize> {
-    debug_assert!(buf.len() >= 256);
+    debug_assert!(buf.len() >= 255);
     let len = try!(read_byte(reader)) as usize;
     if len == 0 { return Ok(0) } // read_to_full will probably freak out
     try!(read_to_full(reader, &mut buf[..len]));
