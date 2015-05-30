@@ -5,7 +5,7 @@ use std::io::Result as IoResult;
 use std::io::{Read, Write};
 use std::env;
 
-static out_dir: &'static str = "output";
+static OUT_DIR: &'static str = "output";
 
 fn main() {
     let mut args = env::args();
@@ -27,15 +27,15 @@ fn do_it(path: &str) -> IoResult<()> {
 	let gif = gif::parse_gif(&buf).unwrap();
 
 
-    if fs::read_dir(out_dir).is_ok() {
-        try!(fs::remove_dir_all(out_dir));
+    if fs::read_dir(OUT_DIR).is_ok() {
+        try!(fs::remove_dir_all(OUT_DIR));
     }
-    try!(fs::create_dir(out_dir));
+    try!(fs::create_dir(OUT_DIR));
 
     for (idx, frame) in gif.frames.iter().enumerate() {
         let image = RBitmap {
-            width: frame.width,
-            height: frame.height,
+            width: gif.width,
+            height: gif.height,
             data: &frame.data,
         };
         try!(save(&image, idx));
@@ -52,7 +52,7 @@ struct RBitmap<'a> {
 }
 
 fn save<'a>(data: &RBitmap<'a>, num: usize) -> IoResult<()> {
-    let file_name = format!("{}/frame-{:03}.tga", out_dir, num);
+    let file_name = format!("{}/frame-{:03}.tga", OUT_DIR, num);
 	let mut file = try!(File::create(&file_name));
 
 	let mut header = [0; 18];

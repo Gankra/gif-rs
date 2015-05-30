@@ -16,7 +16,7 @@
 //! * Header - 6 bytes
 //!     * "GIF87a" or "GIF89a"
 //! * Logical Screen Descriptor - 7 bytes
-//!     * bytes 0-3: LEGACY GARBAGE about canvas dimensions
+//!     * bytes 0-3: (width: u16, height: u16)
 //!     * byte 4:    GCT MEGA FIELD
 //!         * bit 0:    GCT flag (whether there will be one)
 //!         * bits 1-3: GCT resolution --  ??????
@@ -131,15 +131,20 @@ const EXTENSION_COMMENT: u8     = 0xFE;
 const EXTENSION_GRAPHICS: u8    = 0xF9;
 const EXTENSION_APPLICATION: u8 = 0xFF;
 
+const DISPOSAL_UNSPECIFIED: u8 = 0;
+const DISPOSAL_CURRENT: u8 = 1;
+const DISPOSAL_BG: u8 = 2;
+const DISPOSAL_PREVIOUS: u8 = 3;
+
 pub struct Gif {
     pub width: u16,
     pub height: u16,
+    pub num_iterations: u16,
     pub frames: Vec<Frame>,
 }
 
 pub struct Frame {
-    pub width: u16,
-    pub height: u16,
+    pub duration: u16,
     pub data: Vec<u8>
 }
 
@@ -157,8 +162,10 @@ pub fn parse_gif(data: &[u8]) -> Result<Gif, &'static str> {
     if header != b"GIF87a" && header != b"GIF89a" { return Err("Not a GIF"); }
 
     let (descriptor, data) = data.split_at(GLOBAL_DESCRIPTOR_LEN);
+    let full_width = le_u16(descriptor[0], descriptor[1]) as usize;
+    let full_height = le_u16(descriptor[2], descriptor[3]) as usize;
     let gct_mega_field = descriptor[4];
-    let gct_background_color_index = descriptor[5];
+    let gct_background_color_index = descriptor[5] as usize;
     let gct_flag = (gct_mega_field & 0b1000_0000) != 0;
     let gct_size_exponent = gct_mega_field & 0b0000_0111;
     let gct_size = 1usize << (gct_size_exponent + 1); // 2^(k+1)
@@ -179,8 +186,8 @@ pub fn parse_gif(data: &[u8]) -> Result<Gif, &'static str> {
     let mut frame_delay = 0;
     let mut disposal_method = 0;
     let mut frames = vec![];
-    let mut width = 0;
-    let mut height = 0;
+    let mut width;
+    let mut height;
 
     loop {
         let data = temp_data;
@@ -189,8 +196,9 @@ pub fn parse_gif(data: &[u8]) -> Result<Gif, &'static str> {
             BLOCK_EOF => {
                 // TODO: check if this was a sane place to stop?
                 return Ok(Gif {
-                    width: width as u16,
-                    height: height as u16,
+                    width: full_width as u16,
+                    height: full_height as u16,
+                    num_iterations: num_iterations.unwrap_or(1),
                     frames: frames,
                 })
             }
@@ -253,7 +261,6 @@ pub fn parse_gif(data: &[u8]) -> Result<Gif, &'static str> {
                 let data = &data[1..];
                 if data.len() < LOCAL_DESCRIPTOR_LEN { return Err("Unexpected end of GIF"); }
                 let (descriptor, data) = data.split_at(LOCAL_DESCRIPTOR_LEN);
-                println!("local image desc {:?}", descriptor);
                 let x      = le_u16(descriptor[0], descriptor[1]) as usize;
                 let y      = le_u16(descriptor[2], descriptor[3]) as usize;
                 width  = le_u16(descriptor[4], descriptor[5]) as usize;
@@ -281,6 +288,14 @@ pub fn parse_gif(data: &[u8]) -> Result<Gif, &'static str> {
 
                 let mut parse_state = create_parse_state(minimum_code_size, width * height);
 
+                /* For debugging
+                println!("");
+                println!("starting frame decoding: {}", frames.len());
+                println!("x: {}, y: {}, w: {}, h: {}", x, y, width, height);
+                println!("trans: {:?}, interlace: {}", transparent_index, interlace);
+                println!("delay: {}, disposal: {}, iters: {:?}", frame_delay, disposal_method, num_iterations);
+                println!("lct: {}, gct: {}", lct_flag, gct_flag);
+                */
 
                 // ~~~~~~~~~~~~~~ DECODE THE INDICES ~~~~~~~~~~~~~~~~
 
@@ -290,25 +305,72 @@ pub fn parse_gif(data: &[u8]) -> Result<Gif, &'static str> {
                     for i in 0..4 {
                         let mut j = interlaced_offset[i];
                         while j < height {
-                            let offset = j * width; // * 4?
-                            get_line(&mut parse_state, &mut indices[j * width..], width, &mut data);
+                            try!(get_line(&mut parse_state,
+                                          &mut indices[j * width..], width, &mut data));
                             j += interlaced_jumps[i];
                         }
                     }
                 } else {
-                    get_line(&mut parse_state, &mut indices, width * height, &mut data);
+                    try!(get_line(&mut parse_state, &mut indices, width * height, &mut data));
                 }
 
                 // ~~~~~~~~~~~ MAP THE INDICES TO COLOURS ~~~~~~~~~~~
 
-                let mut pixels = vec![0; width * height * 4]; // RGBA
+                let num_bytes = full_width * full_height * 4;
+
+                let mut pixels = match disposal_method {
+                    DISPOSAL_UNSPECIFIED => {
+                        vec![0; num_bytes]
+                    }
+                    DISPOSAL_CURRENT => {
+                        frames.last().map(|frame| frame.data.clone())
+                                     .unwrap_or_else(|| vec![0; num_bytes])
+                    }
+                    DISPOSAL_BG => {
+                        let col_idx = gct_background_color_index as usize;
+                        let color_map = gct.as_ref().unwrap();
+                        let is_transparent = transparent_index.map(|idx| idx as usize == col_idx)
+                                                              .unwrap_or(false);
+                        let (r, g, b, a) = if is_transparent {
+                            (0, 0, 0, 0)
+                        } else {
+                            let col_idx = col_idx as usize;
+                            let r = color_map[col_idx * 3 + 0];
+                            let g = color_map[col_idx * 3 + 1];
+                            let b = color_map[col_idx * 3 + 2];
+                            (r, g, b, 0xFF)
+                        };
+
+                        let mut buf = Vec::with_capacity(num_bytes);
+                        while buf.len() < num_bytes {
+                            buf.push(r);
+                            buf.push(g);
+                            buf.push(b);
+                            buf.push(a);
+                        }
+                        buf
+                    }
+                    DISPOSAL_PREVIOUS => {
+                        let num_frames = frames.len();
+                        if num_frames > 1 {
+                            frames[num_frames - 2].data.clone()
+                        } else {
+                            vec![0; num_bytes]
+                        }
+                    }
+                    _ => {
+                        return Err("unsupported disposal method");
+                    }
+                };
+
 
                 let color_map = lct.as_ref().unwrap_or_else(|| gct.as_ref().unwrap());
                 for (pix_idx, col_idx) in indices.into_iter().enumerate() {
                     let is_transparent = transparent_index.map(|idx| idx == col_idx)
                                                           .unwrap_or(false);
                     let (r, g, b, a) = if is_transparent {
-                        (0, 0, 0, 0)
+                        continue;
+                        // (0, 0, 0, 0)
                     } else {
                         let col_idx = col_idx as usize;
                         let r = color_map[col_idx * 3 + 0];
@@ -316,6 +378,17 @@ pub fn parse_gif(data: &[u8]) -> Result<Gif, &'static str> {
                         let b = color_map[col_idx * 3 + 2];
                         (r, g, b, 0xFF)
                     };
+
+                    // we're blitting this frame on top of some perhaps larger
+                    // canvas. We need to adjust accordingly.
+                    let pix_idx = x + y * full_width +
+                        if width == full_width {
+                            pix_idx
+                        } else {
+                            let row = pix_idx / width;
+                            let col = pix_idx % width;
+                            row * full_width + col
+                        };
                     pixels[pix_idx * 4 + 0] = r;
                     pixels[pix_idx * 4 + 1] = g;
                     pixels[pix_idx * 4 + 2] = b;
@@ -324,20 +397,17 @@ pub fn parse_gif(data: &[u8]) -> Result<Gif, &'static str> {
                 // TODO: use the processed data (disposal method, etc)
 
                 frames.push(Frame {
-                    width: width as u16,
-                    height: height as u16,
-                    data: pixels
+                    data: pixels,
+                    duration: frame_delay,
                 });
 
-                // TODO: reset the fields
-                temp_data = &data[1..];
+                temp_data = data;
                 transparent_index = None;
                 frame_delay = 0;
                 disposal_method = 0;
             }
-            x => {
-                println!("Bad block: {:02X}", x);
-                return Err("Unknown block type found");
+            _ => {
+                return Err("unknown block found");
             }
         }
 
@@ -393,31 +463,32 @@ fn create_parse_state(code_size: u8, pixel_count: usize) -> ParseState {
     }
 }
 
-fn get_line(state: &mut ParseState, line: &mut[u8], line_len: usize, data: &mut &[u8]) {
+fn get_line(state: &mut ParseState, line: &mut[u8], line_len: usize, data: &mut &[u8])
+        -> Result<(), &'static str> {
     state.pixel_count -= line_len;
     if state.pixel_count > 0xffff0000 {
-        panic!("Gif has too much pixel data");
+        return Err("Gif has too much pixel data");
     }
 
-    decompress_line(state, line, line_len, data);
+    try!(decompress_line(state, line, line_len, data));
 
     if state.pixel_count == 0 {
-        // TODO: giflib seems to think there might be more gif left after
-        // this is done. Should probably skip through the rest of the blocks
-        // here so that the stream is in the right place.
-        let bytes_left = state.buf[0] as usize;
-        *data = &data[bytes_left..];
-
+        // giflib seems to think there might be more data left after we get here
+        // so skip through the rest.
         loop {
             let to_skip = data[0] as usize;
             if to_skip == 0 { break; }
-            if data.len() < to_skip + 2 { panic!("Unexpected end of GIF"); }
+            if data.len() < to_skip + 2 { return Err("Unexpected end of GIF"); }
             *data = &data[to_skip+1..];
         }
+        *data = &data[1..];
     }
+
+    Ok(())
 }
 
-fn decompress_line(state: &mut ParseState, line: &mut[u8], line_len: usize, data: &mut &[u8]) {
+fn decompress_line(state: &mut ParseState, line: &mut[u8], line_len: usize, data: &mut &[u8])
+        -> Result<(), &'static str> {
     let mut i = 0;
     let mut current_prefix; // This is uninit in dgif
     let &mut ParseState {
@@ -428,7 +499,7 @@ fn decompress_line(state: &mut ParseState, line: &mut[u8], line_len: usize, data
         ..
     } = state;
 
-    assert!(stack_ptr <= LZ_MAX_CODE, "TODO: I don't know why yet");
+    if stack_ptr > LZ_MAX_CODE { return Err("Malformed GIF"); }
     while stack_ptr != 0 && i < line_len {
         stack_ptr -= 1;
         line[i] = state.stack[stack_ptr];
@@ -436,7 +507,7 @@ fn decompress_line(state: &mut ParseState, line: &mut[u8], line_len: usize, data
     }
 
     while i < line_len {
-        let current_code = decompress_input(state, data);
+        let current_code = try!(decompress_input(state, data));
 
         let &mut ParseState {
             ref mut prefix,
@@ -445,7 +516,7 @@ fn decompress_line(state: &mut ParseState, line: &mut[u8], line_len: usize, data
             ..
         } = state;
 
-        assert!(current_code != eof_code, "Unexpected end of image");
+        if current_code == eof_code { return Err("Unexpected end of GIF"); }
 
         if current_code == clear_code {
             // Reset all the sweet codez we learned
@@ -503,7 +574,7 @@ fn decompress_line(state: &mut ParseState, line: &mut[u8], line_len: usize, data
                 }
 
                 if stack_ptr >= LZ_MAX_CODE || current_prefix > LZ_MAX_CODE {
-                    panic!("Image defect???");
+                    return Err("Malformed GIF");
                 }
 
                 stack[stack_ptr] = current_prefix as u8;
@@ -539,6 +610,8 @@ fn decompress_line(state: &mut ParseState, line: &mut[u8], line_len: usize, data
 
     state.last_code = last_code;
     state.stack_ptr = stack_ptr;
+
+    Ok(())
 }
 
 // Prefix is a virtual linked list or something.
@@ -556,7 +629,7 @@ fn get_prefix_char(prefix: &[usize], mut code: usize, clear_code: usize) -> usiz
     return code;
 }
 
-fn decompress_input(state: &mut ParseState, src: &mut &[u8]) -> usize {
+fn decompress_input(state: &mut ParseState, src: &mut &[u8]) -> Result<usize, &'static str> {
     let code_masks: [usize; 13] = [
         0x0000, 0x0001, 0x0003, 0x0007,
         0x000f, 0x001f, 0x003f, 0x007f,
@@ -573,7 +646,7 @@ fn decompress_input(state: &mut ParseState, src: &mut &[u8]) -> usize {
             let len = src[0] as usize;
             state.buf[0] = len as u8;
 
-            assert!(len != 0 && src.len() > len, "Unexpected end of GIF");
+            if len == 0 || src.len() <= len { return Err("Unexpected end of GIF"); }
 
             // Copy next len bytes from src to buf
             for i in 0..len {
@@ -590,7 +663,8 @@ fn decompress_input(state: &mut ParseState, src: &mut &[u8]) -> usize {
         } else {
             // Still got bytes in this block
             let next_byte = state.buf[state.buf[1] as usize];
-            state.buf[1] += 1;
+            // this overflows when the line is 255 bytes long, and that's ok
+            state.buf[1] = state.buf[1].wrapping_add(1);
             state.buf[0] -= 1;
             next_byte
         };
@@ -611,7 +685,7 @@ fn decompress_input(state: &mut ParseState, src: &mut &[u8]) -> usize {
         }
     }
 
-    code
+    Ok(code)
 }
 
 fn le_u16(first: u8, second: u8) -> u16 {
