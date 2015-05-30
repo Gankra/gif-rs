@@ -178,8 +178,6 @@ pub fn parse_gif<R: Read>(mut data: R) -> IoResult<Gif> {
     let mut frame_delay = 0;
     let mut disposal_method = 0;
     let mut frames = vec![];
-    let mut width;
-    let mut height;
 
     loop {
         match try!(read_byte(&mut data)) {
@@ -233,10 +231,10 @@ pub fn parse_gif<R: Read>(mut data: R) -> IoResult<Gif> {
                 let mut descriptor = [0; LOCAL_DESCRIPTOR_LEN];
                 try!(read_to_full(&mut data, &mut descriptor));
 
-                let x  = le_u16(descriptor[0], descriptor[1]) as usize;
-                let y  = le_u16(descriptor[2], descriptor[3]) as usize;
-                width  = le_u16(descriptor[4], descriptor[5]) as usize;
-                height = le_u16(descriptor[6], descriptor[7]) as usize;
+                let x      = le_u16(descriptor[0], descriptor[1]) as usize;
+                let y      = le_u16(descriptor[2], descriptor[3]) as usize;
+                let width  = le_u16(descriptor[4], descriptor[5]) as usize;
+                let height = le_u16(descriptor[6], descriptor[7]) as usize;
 
                 let lct_mega_field = descriptor[8];
                 let lct_flag = (lct_mega_field & 0b1000_0000) != 0;
