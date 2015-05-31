@@ -601,7 +601,7 @@ fn decompress_input<R: Read>(state: &mut ParseState, src: &mut R) -> IoResult<us
         0x0fff
     ];
 
-    assert!(state.running_bits <= LZ_BITS); // Make an Err later
+    if state.running_bits > LZ_BITS { return Err(malformed()) }
 
     while state.current_shift_state < state.running_bits {
         // Get the next byte, which is either in this block or the next one

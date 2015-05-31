@@ -21,8 +21,7 @@ fn main() {
 fn do_it(path: &str) -> IoResult<()> {
 	let file = try!(File::open(path));
 
-	let gif = gif::parse_gif(&file).unwrap();
-
+	let gif = try!(gif::parse_gif(&file));
 
     if fs::read_dir(OUT_DIR).is_ok() {
         try!(fs::remove_dir_all(OUT_DIR));
@@ -37,7 +36,6 @@ fn do_it(path: &str) -> IoResult<()> {
         };
         try!(save(&image, idx));
     }
-
 
 	Ok(())
 }
