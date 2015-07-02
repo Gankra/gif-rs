@@ -19,7 +19,7 @@
 //!     * bytes 0-3: (width: u16, height: u16)
 //!     * byte 4:    GCT MEGA FIELD
 //!         * bit 0:    GCT flag (whether there will be one)
-//!         * bits 1-3: GCT resolution --  ??????
+//!         * bits 1-3: GCT resolution -- ??????
 //!         * bit 4:    LEGACY GARBAGE about sorting
 //!         * bits 5-7: GCT size -- k -> 2^(k + 1) entries in the GCT
 //!     * byte 5:    GCT background colour index
@@ -63,6 +63,7 @@
 //!                 * bytes 2-3: u16 frame length in hundredths-of-a-second
 //!                 * byte 4:    transparent colour index
 //!                     * if transparent flag set, interpret this colour index as 100% transparent
+//!                     * note that this means "reuse the old pixel" if using disposal current/prev
 //!                 * byte 5: '00'
 //!         * '2C': An Actual Image:
 //!             * image descriptor info - 9 bytes
@@ -78,7 +79,7 @@
 //!                 * byte 0:   minimum LZW code size (used in decompression)
 //!                 * blocks of LZW data until you hit one that has size 0
 //!                     * byte 0: block size in bytes (not including this one!)
-//!                     * bytes 1-n: LZW'd data (see below for decoding)
+//!                     * bytes 1-n: LZW'd data
 //!
 //!
 //! ## Decoding Image Data
@@ -225,7 +226,7 @@ pub fn parse_gif<R: Read>(mut data: R) -> IoResult<Gif> {
                         let mut ext = [0; APPLICATION_EXTENSION_LEN];
                         try!(read_to_full(&mut data, &mut ext));
 
-                        // TODO: Verify this the NETSCAPE 2.0 extension?
+                        // TODO: Verify this is the NETSCAPE 2.0 extension?
 
                         num_iterations = Some(le_u16(ext[14], ext[15]));
                     }
@@ -282,15 +283,15 @@ pub fn parse_gif<R: Read>(mut data: R) -> IoResult<Gif> {
                     for i in 0..4 {
                         let mut j = interlaced_offset[i];
                         while j < height {
-                            try!(get_line(&mut parse_state,
-                                          &mut indices[j * width..],
-                                          width,
-                                          &mut data));
+                            try!(get_indices(&mut parse_state,
+                                             &mut indices[j * width..],
+                                             width,
+                                             &mut data));
                             j += interlaced_jumps[i];
                         }
                     }
                 } else {
-                    try!(get_line(&mut parse_state, &mut indices, width * height, &mut data));
+                    try!(get_indices(&mut parse_state, &mut indices, width * height, &mut data));
                 }
 
                 // ~~~~~~~~~~~~~~ INITIALIZE THE BACKGROUND ~~~~~~~~~~~
@@ -438,22 +439,20 @@ fn create_parse_state(code_size: u8, pixel_count: usize) -> ParseState {
         current_shift_state: 0,
         current_shift_dword: 0,
         prefix: [NO_SUCH_CODE; LZ_MAX_CODE + 1],
-
-        // TODO: verify these initializations
         suffix: [0; LZ_MAX_CODE + 1],
         stack: [0; LZ_MAX_CODE],
         pixel_count: pixel_count,
     }
 }
 
-fn get_line<R: Read>(state: &mut ParseState, line: &mut[u8], line_len: usize, data: &mut R)
+fn get_indices<R: Read>(state: &mut ParseState, indices: &mut[u8], index_count: usize, data: &mut R)
         -> IoResult<()> {
-    state.pixel_count -= line_len;
+    state.pixel_count -= index_count;
     if state.pixel_count > 0xffff0000 {
         return Err(Error::new(InvalidInput, "Gif has too much pixel data"));
     }
 
-    try!(decompress_line(state, line, line_len, data));
+    try!(decompress_indices(state, indices, index_count, data));
 
     if state.pixel_count == 0 {
         // There might be some more data hanging around. Finish walking through
@@ -464,7 +463,7 @@ fn get_line<R: Read>(state: &mut ParseState, line: &mut[u8], line_len: usize, da
     Ok(())
 }
 
-fn decompress_line<R: Read>(state: &mut ParseState, line: &mut[u8], line_len: usize, data: &mut R)
+fn decompress_indices<R: Read>(state: &mut ParseState, indices: &mut[u8], index_count: usize, data: &mut R)
         -> IoResult<()> {
     let mut i = 0;
     let mut current_prefix; // This is uninit in dgif
@@ -477,13 +476,13 @@ fn decompress_line<R: Read>(state: &mut ParseState, line: &mut[u8], line_len: us
     } = state;
 
     if stack_ptr > LZ_MAX_CODE { return Err(malformed()); }
-    while stack_ptr != 0 && i < line_len {
+    while stack_ptr != 0 && i < index_count {
         stack_ptr -= 1;
-        line[i] = state.stack[stack_ptr];
+        indices[i] = state.stack[stack_ptr];
         i += 1;
     }
 
-    while i < line_len {
+    while i < index_count {
         let current_code = try!(decompress_input(state, data));
 
         let &mut ParseState {
@@ -510,7 +509,7 @@ fn decompress_line<R: Read>(state: &mut ParseState, line: &mut[u8], line_len: us
             // Regular code
             if current_code < clear_code {
                 // single index code, direct mapping to a colour index
-                line[i] = current_code as u8;
+                indices[i] = current_code as u8;
                 i += 1;
             } else {
                 // MULTI-CODE MULTI-CODE ENGAGE -- DASH DASH DASH!!!!
@@ -548,9 +547,9 @@ fn decompress_line<R: Read>(state: &mut ParseState, line: &mut[u8], line_len: us
                 stack[stack_ptr] = current_prefix as u8;
                 stack_ptr += 1;
 
-                while stack_ptr != 0 && i < line_len {
+                while stack_ptr != 0 && i < index_count {
                     stack_ptr -= 1;
-                    line[i] = stack[stack_ptr];
+                    indices[i] = stack[stack_ptr];
                     i += 1;
                 }
 
@@ -691,7 +690,6 @@ fn read_block<R: Read>(reader: &mut R, buf: &mut [u8]) -> IoResult<usize> {
 }
 
 fn le_u16(first: u8, second: u8) -> u16 {
-    // TODO: verify this; I am bad at endian stuff
     ((second as u16) << 8) | (first as u16)
 }
 
