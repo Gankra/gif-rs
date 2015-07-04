@@ -1,6 +1,6 @@
 #![feature(exit_status, path_ext)]
 
-extern crate rust_media;
+extern crate gif;
 extern crate byteorder;
 
 use std::env;
@@ -12,8 +12,7 @@ use std::path::{Path, PathBuf};
 
 use byteorder::{LittleEndian, ByteOrder};
 
-use rust_media::playback::Player;
-use rust_media::videodecoder::*;
+use gif::Gif;
 
 pub fn main() {
     match do_it() {
@@ -48,7 +47,12 @@ fn do_it() -> IoResult<(u32, u32)> {
             buf.push("input.gif");
             let input = Box::new(try!(File::open(&buf)));
 
-            let mut player = Player::new(input, "image/gif");
+            let gif = Gif::new(input);
+            if gif.is_err() {
+                println!(" Test failed -- could not instantiate Gif");
+                continue 'main;
+            }
+            let mut gif = gif.ok().unwrap();
 
             let mut outputs = vec![];
             for entry in try!(fs::read_dir(&dir_path)) {
@@ -63,51 +67,46 @@ fn do_it() -> IoResult<(u32, u32)> {
                 let output = try!(File::open(output));
                 let ref_frame = try!(parse_tga(output));
 
-                if player.decode_frame().is_err() {
+                if let Err(err) = gif.parse_next_frame() {
                     println!("  Test failed -- could not decode frame {}", frame_no);
+                    println!("{:?}", err);
                     continue 'main;
                 }
-                if let Ok(frame) = player.advance() {
-                    let frame = frame.video_frame.unwrap();
-                    let width = frame.width();
-                    let height = frame.height();
-                    let lock = frame.lock();
-                    let data = lock.pixels(0);
-                    if ref_frame.width != width || ref_frame.height != height {
-                        println!("  Test failed -- incorrect dimensions of frame {}", frame_no);
-                        println!("    Expected {}x{}", ref_frame.width, ref_frame.height);
-                        println!("       Found {}x{}", width, height);
-                        continue 'main;
-                    }
 
-                    if data.len() != ref_frame.data.len() {
+                let frame = gif.get_frame(frame_no);
+                let width = gif.width();
+                let height = gif.height();
+                let data = &frame.data;
+
+                if ref_frame.width != width || ref_frame.height != height {
+                    println!("  Test failed -- incorrect dimensions of frame {}", frame_no);
+                    println!("    Expected {}x{}", ref_frame.width, ref_frame.height);
+                    println!("       Found {}x{}", width, height);
+                    continue 'main;
+                }
+
+                if data.len() != ref_frame.data.len() {
+                    println!("  Test failed -- pixel data didn't match for frame {}", frame_no);
+                    let mut failure_path = PathBuf::from("tests/failures");
+                    failure_path.push(&format!("{}-frame{:05}.tga", dir_name, frame_no));
+                    try!(save_tga(width, height, data, &failure_path, ref_frame.id_len));
+                    continue 'main;
+                }
+
+                for i in 0..data.len()/4 {
+                    let idx = i * 4;
+                    let data_pixel = &data[idx .. idx + 4];
+                    let ref_pixel = &ref_frame.data[idx .. idx + 4];
+                    // either the pixels are equal, or they're both transparent
+                    if (data_pixel != ref_pixel)
+                        && (data_pixel[3] != 0 || ref_pixel[3] != 0) {
+
                         println!("  Test failed -- pixel data didn't match for frame {}", frame_no);
                         let mut failure_path = PathBuf::from("tests/failures");
                         failure_path.push(&format!("{}-frame{:05}.tga", dir_name, frame_no));
                         try!(save_tga(width, height, data, &failure_path, ref_frame.id_len));
                         continue 'main;
                     }
-                    for i in 0..data.len()/4 {
-                        let idx = i * 4;
-                        let data_pixel = &data[idx .. idx + 4];
-                        let ref_pixel = &ref_frame.data[idx .. idx + 4];
-                        // either the pixels are equal, or they're both transparent
-                        if (data_pixel != ref_pixel)
-                            && (data_pixel[3] != 0 || ref_pixel[3] != 0) {
-
-                            println!("  Test failed -- pixel data didn't match for frame {}", frame_no);
-                            let mut failure_path = PathBuf::from("tests/failures");
-                            failure_path.push(&format!("{}-frame{:05}.tga", dir_name, frame_no));
-                            try!(save_tga(width, height, data, &failure_path, ref_frame.id_len));
-                            continue 'main;
-                        }
-                    }
-                    if data != &*ref_frame.data {
-
-                    }
-                } else {
-                    println!("  Test failed -- could not advance to frame {}", frame_no);
-                    continue 'main;
                 }
             }
             // If we didn't `continue` then the test passed

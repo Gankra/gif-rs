@@ -104,9 +104,8 @@
 //!      data block (thing that starts with 8C) in binary:
 //! EOF:         3B
 
-use std::io::Result as IoResult;
-use std::io::ErrorKind::InvalidInput;
-use std::io::{Read, Error};
+use std::io::{Read, Seek, SeekFrom};
+use std::io::Error as IoError;
 
 const HEADER_LEN: usize = 6;
 const GLOBAL_DESCRIPTOR_LEN: usize = 7;
@@ -129,272 +128,373 @@ const DISPOSAL_CURRENT: u8 = 1;
 const DISPOSAL_BG: u8 = 2;
 const DISPOSAL_PREVIOUS: u8 = 3;
 
-pub struct Gif {
-    pub width: u16,
-    pub height: u16,
+const BYTES_PER_COL: usize = 4;
+
+pub struct Gif<R> {
+    pub width: usize,
+    pub height: usize,
+    /// Defaults to 1, but at some point we may discover a new value.
+    /// Presumably this should only happen once.
     pub num_iterations: u16,
     pub frames: Vec<Frame>,
+    gct_bg: usize,
+    gct: Option<Box<[u8; MAX_COLOR_TABLE_SIZE]>>,
+    data: R,
+    image_parse_state: Option<Box<LzwParseState>>,
+    stream_pos: u64,
+
+    // where we are
+    parsing_metadata: bool,
+
+    // info we *might* find while parsing metadata
+    transparent_index: Option<u8>,
+    frame_delay: u16,
+    disposal_method: u8,
 }
 
 pub struct Frame {
-    pub duration: u16,
+    pub time: u32,
+    pub duration: u32,
     pub data: Vec<u8>
 }
 
+#[derive(Debug)]
+pub enum Error {
+    IoError,
+    Malformed,
+    EndOfFile,
+}
 
-pub fn parse_gif<R: Read>(mut data: R) -> IoResult<Gif> {
-    // Note: this code frequently creates new "data" variables to represent all the bytes we
-    // haven't read yet. This is just more convenient than re-assigning `data` or tracking our
-    // position otherwise.
+impl From<IoError> for Error {
+    fn from(_: IoError) -> Error { Error::IoError }
+}
 
-    // ~~~~~~~~~ Image Prelude ~~~~~~~~~~
-    let mut buf = [0; HEADER_LEN + GLOBAL_DESCRIPTOR_LEN];
-    try!(read_to_full(&mut data, &mut buf));
+pub type GifResult<T> = Result<T, Error>;
 
-    let (header, descriptor) = buf.split_at(HEADER_LEN);
-    if header != b"GIF87a" && header != b"GIF89a" { return Err(malformed()); }
+impl<R: Read + Seek> Gif<R> {
+    /// Interpret the given Reader as an entire Gif file. Parses out the
+    /// prelude to get most metadata (some will show up later, maybe).
+    ///
+    /// Returns an Error if the stream isn't long enough to get the whole
+    /// header in one shot.
+    pub fn new (mut data: R) -> GifResult<Gif<R>> {
 
-    let full_width = le_u16(descriptor[0], descriptor[1]) as usize;
-    let full_height = le_u16(descriptor[2], descriptor[3]) as usize;
-    let gct_mega_field = descriptor[4];
-    let gct_background_color_index = descriptor[5] as usize;
-    let gct_flag = (gct_mega_field & 0b1000_0000) != 0;
-    let gct_size_exponent = gct_mega_field & 0b0000_0111;
-    let gct_size = 1usize << (gct_size_exponent + 1); // 2^(k+1)
+        // ~~~~~~~~~ Image Prelude ~~~~~~~~~~
+        let mut buf = [0; HEADER_LEN + GLOBAL_DESCRIPTOR_LEN];
+        try!(read_to_full(&mut data, &mut buf));
 
-    let mut gct_buf = [0; MAX_COLOR_TABLE_SIZE];
+        let (header, descriptor) = buf.split_at(HEADER_LEN);
+        if header != b"GIF87a" && header != b"GIF89a" { return Err(Error::Malformed); }
 
-    let gct = if gct_flag {
-        let gct = &mut gct_buf[.. 3 * gct_size];
-        try!(read_to_full(&mut data, gct));
-        Some(gct)
-    } else {
-        None
-    };
+        let full_width = le_u16(descriptor[0], descriptor[1]);
+        let full_height = le_u16(descriptor[2], descriptor[3]);
+        let gct_mega_field = descriptor[4];
+        let gct_background_color_index = descriptor[5] as usize;
+        let gct_flag = (gct_mega_field & 0b1000_0000) != 0;
+        let gct_size_exponent = gct_mega_field & 0b0000_0111;
+        let gct_size = 1usize << (gct_size_exponent + 1); // 2^(k+1)
 
-    // ~~~~~~~~~ Image Body ~~~~~~~~~~~
-
-    // global to the whole gif, probably should only be set once (if ever)
-    let mut num_iterations = None;
-
-    // local to this frame of the gif, but may be obtained at any time
-    // should be reset when the frame itself is processed.
-    let mut transparent_index = None;
-    let mut frame_delay = 0;
-    let mut disposal_method = 0;
-
-    let mut frames = vec![];
-
-    loop {
-        match try!(read_byte(&mut data)) {
-            BLOCK_EOF => {
-                // TODO: check if this was a sane place to stop?
-                return Ok(Gif {
-                    width: full_width as u16,
-                    height: full_height as u16,
-                    num_iterations: num_iterations.unwrap_or(1),
-                    frames: frames,
-                })
+        let gct = if gct_flag {
+            let mut gct_buf = Box::new([0; MAX_COLOR_TABLE_SIZE]);
+            {
+                let gct = &mut gct_buf[.. 3 * gct_size];
+                try!(read_to_full(&mut data, gct));
             }
-            BLOCK_EXTENSION => {
-                // 3 to coalesce some checks we'll have to make in any branch
-                match try!(read_byte(&mut data)) {
-                    EXTENSION_PLAIN | EXTENSION_COMMENT => {
-                        // This is legacy garbage, but has a variable length so
-                        // we need to parse it a bit to get over it.
-                        try!(skip_blocks(&mut data));
+            Some(gct_buf)
+        } else {
+            None
+        };
+
+        let mut gif = Gif {
+            width: full_width as usize,
+            height: full_height as usize,
+            num_iterations: 1, // This may be changed as we parse more
+            frames: vec![],
+            gct_bg: gct_background_color_index,
+            gct: gct,
+            data: data,
+            image_parse_state: None,
+            stream_pos: 0,
+            parsing_metadata: true,
+
+            transparent_index: None,
+            frame_delay: 0,
+            disposal_method: 0,
+        };
+
+        gif.save_stream_position();
+        try!(gif.parse_metadata_blocks());
+
+        Ok(gif)
+    }
+
+    pub fn parse_next_frame(&mut self) -> GifResult<bool> {
+        if self.parsing_metadata {
+            let has_next_frame = try!(self.parse_metadata_blocks());
+            if !has_next_frame { return Ok(false) }
+        }
+
+        try!(self.parse_image_block());
+
+        Ok(true)
+    }
+
+    #[inline] pub fn get_frame(&self, idx: usize) -> &Frame { &self.frames[idx] }
+    #[inline] pub fn width(&self) -> u32 { self.width as u32 }
+    #[inline] pub fn height(&self) -> u32 { self.height as u32 }
+
+    fn save_stream_position(&mut self) {
+        //self.stream_pos = self.data.seek(SeekFrom::Current(0)).unwrap();
+    }
+
+    fn load_stream_position(&mut self) {
+        //self.data.seek(SeekFrom::Start(self.stream_pos)).unwrap();
+    }
+
+    /// Reads more of the stream until an entire new frame has been computed.
+    /// Returns `false` if the file ends, and `true` otherwise.
+    fn parse_metadata_blocks(&mut self) -> GifResult<bool> {
+        self.load_stream_position();
+
+        loop {
+            match try!(read_byte(&mut self.data)) {
+                BLOCK_EOF => {
+                    return Ok(false)
+                }
+                BLOCK_EXTENSION => {
+                    match try!(read_byte(&mut self.data)) {
+                        EXTENSION_PLAIN | EXTENSION_COMMENT => {
+                            // This is legacy garbage, but has a variable length so
+                            // we need to parse it a bit to get over it.
+                            try!(skip_blocks(&mut self.data));
+                        }
+                        EXTENSION_GRAPHICS => {
+                            // Frame delay and transparency settings
+                            let mut ext = [0; GRAPHICS_EXTENSION_LEN];
+                            try!(read_to_full(&mut self.data, &mut ext));
+
+                            let rendering_mega_field = ext[1];
+                            let transparency_flag = (rendering_mega_field & 0b0000_0001) != 0;
+
+                            self.disposal_method =
+                                (rendering_mega_field & 0b0001_1100) >> 2;
+
+                            self.frame_delay = le_u16(ext[2], ext[3]);
+
+                            self.transparent_index = if transparency_flag {
+                                Some(ext[4])
+                            } else {
+                                None
+                            };
+                        }
+                        EXTENSION_APPLICATION => {
+                            // NETSCAPE 2.0 Looping Extension
+
+                            let mut ext = [0; APPLICATION_EXTENSION_LEN];
+                            try!(read_to_full(&mut self.data, &mut ext));
+
+                            // TODO: Verify this is the NETSCAPE 2.0 extension?
+
+                            self.num_iterations = le_u16(ext[14], ext[15]);
+                        }
+                        _ => {
+                            // unknown extension type
+                            return Err(Error::Malformed);
+                        }
                     }
-                    EXTENSION_GRAPHICS => {
-                        // Frame delay and transparency settings
-                        let mut ext = [0; GRAPHICS_EXTENSION_LEN];
-                        try!(read_to_full(&mut data, &mut ext));
-
-                        let rendering_mega_field = ext[1];
-                        let transparency_flag = (rendering_mega_field & 0b0000_0001) != 0;
-
-                        disposal_method = (rendering_mega_field & 0b0001_1100) >> 2;
-                        frame_delay = le_u16(ext[2], ext[3]);
-                        transparent_index = if transparency_flag {
-                            Some(ext[4])
-                        } else {
-                            None
-                        };
-                    }
-                    EXTENSION_APPLICATION => {
-                        // NETSCAPE 2.0 Looping Extension
-
-                        let mut ext = [0; APPLICATION_EXTENSION_LEN];
-                        try!(read_to_full(&mut data, &mut ext));
-
-                        // TODO: Verify this is the NETSCAPE 2.0 extension?
-
-                        num_iterations = Some(le_u16(ext[14], ext[15]));
-                    }
-                    _ => { return Err(Error::new(InvalidInput, "Unknown extension type found")); }
+                    self.save_stream_position();
+                }
+                BLOCK_IMAGE => {
+                    self.parsing_metadata = false;
+                    self.save_stream_position();
+                    return Ok(true)
+                }
+                _ => {
+                    // unknown block type
+                    return Err(Error::Malformed);
                 }
             }
-            BLOCK_IMAGE => {
-                let mut descriptor = [0; LOCAL_DESCRIPTOR_LEN];
-                try!(read_to_full(&mut data, &mut descriptor));
+        }
+    }
 
-                let x      = le_u16(descriptor[0], descriptor[1]) as usize;
-                let y      = le_u16(descriptor[2], descriptor[3]) as usize;
-                let width  = le_u16(descriptor[4], descriptor[5]) as usize;
-                let height = le_u16(descriptor[6], descriptor[7]) as usize;
+    fn parse_image_block(&mut self) -> GifResult<()> {
+        self.load_stream_position();
 
-                let lct_mega_field = descriptor[8];
-                let lct_flag = (lct_mega_field & 0b1000_0000) != 0;
-                let interlace = (lct_mega_field & 0b0100_0000) != 0;
-                let lct_size_exponent = (lct_mega_field & 0b0000_1110) >> 1;
-                let lct_size = 1usize << (lct_size_exponent + 1); // 2^(k+1)
+        let mut descriptor = [0; LOCAL_DESCRIPTOR_LEN];
+        try!(read_to_full(&mut self.data, &mut descriptor));
+
+        let x      = le_u16(descriptor[0], descriptor[1]) as usize;
+        let y      = le_u16(descriptor[2], descriptor[3]) as usize;
+        let width  = le_u16(descriptor[4], descriptor[5]) as usize;
+        let height = le_u16(descriptor[6], descriptor[7]) as usize;
+
+        let lct_mega_field = descriptor[8];
+        let lct_flag = (lct_mega_field & 0b1000_0000) != 0;
+        let interlace = (lct_mega_field & 0b0100_0000) != 0;
+        let lct_size_exponent = (lct_mega_field & 0b0000_1110) >> 1;
+        let lct_size = 1usize << (lct_size_exponent + 1); // 2^(k+1)
 
 
-                let mut lct_buf = [0; MAX_COLOR_TABLE_SIZE];
+        let mut lct_buf = [0; MAX_COLOR_TABLE_SIZE];
 
-                let lct = if lct_flag {
-                    let lct = &mut lct_buf[.. 3 * lct_size];
-                    try!(read_to_full(&mut data, lct));
-                    Some(lct)
-                } else {
-                    None
-                };
+        let lct = if lct_flag {
+            let lct = &mut lct_buf[.. 3 * lct_size];
+            try!(read_to_full(&mut self.data, lct));
+            Some(&*lct)
+        } else {
+            None
+        };
 
-                let minimum_code_size = try!(read_byte(&mut data));
+        let minimum_code_size = try!(read_byte(&mut self.data));
 
-                let mut indices = vec![0; width * height]; //TODO: not this
+        let mut indices = vec![0; width * height]; //TODO: not this
 
-                let mut parse_state = create_parse_state(minimum_code_size, width * height);
+        /* For debugging
+        println!("");
+        println!("starting frame decoding: {}", self.frames.len());
+        println!("x: {}, y: {}, w: {}, h: {}", x, y, width, height);
+        println!("trans: {:?}, interlace: {}", transparent_index, interlace);
+        println!("delay: {}, disposal: {}, iters: {:?}",
+                 frame_delay, disposal_method, self.num_iterations);
+        println!("lct: {}, gct: {}", lct_flag, self.gct.is_some());
+        */
 
-                /* For debugging
-                println!("");
-                println!("starting frame decoding: {}", frames.len());
-                println!("x: {}, y: {}, w: {}, h: {}", x, y, width, height);
-                println!("trans: {:?}, interlace: {}", transparent_index, interlace);
-                println!("delay: {}, disposal: {}, iters: {:?}",
-                         frame_delay, disposal_method, num_iterations);
-                println!("lct: {}, gct: {}", lct_flag, gct_flag);
-                */
+        // ~~~~~~~~~~~~~~ DECODE THE INDICES ~~~~~~~~~~~~~~~~
 
-                // ~~~~~~~~~~~~~~ DECODE THE INDICES ~~~~~~~~~~~~~~~~
+        let mut parse_state = create_lzw_parse_state(minimum_code_size, width * height);
 
-                if interlace {
-                    let interlaced_offset = [0, 4, 2, 1];
-                    let interlaced_jumps = [8, 8, 4, 2];
-                    for i in 0..4 {
-                        let mut j = interlaced_offset[i];
-                        while j < height {
-                            try!(get_indices(&mut parse_state,
-                                             &mut indices[j * width..],
-                                             width,
-                                             &mut data));
-                            j += interlaced_jumps[i];
-                        }
-                    }
-                } else {
-                    try!(get_indices(&mut parse_state, &mut indices, width * height, &mut data));
+        if interlace {
+            let interlaced_offset = [0, 4, 2, 1];
+            let interlaced_jumps = [8, 8, 4, 2];
+            for i in 0..4 {
+                let mut j = interlaced_offset[i];
+                while j < height {
+                    try!(get_indices(&mut parse_state,
+                                     &mut indices[j * width..],
+                                     width,
+                                     &mut self.data));
+
+                    j += interlaced_jumps[i];
                 }
+            }
+        } else {
+            try!(get_indices(&mut parse_state,
+                             &mut indices,
+                             width * height,
+                             &mut self.data));
+        }
 
-                // ~~~~~~~~~~~~~~ INITIALIZE THE BACKGROUND ~~~~~~~~~~~
+        // ~~~~~~~~~~~~~~ INITIALIZE THE BACKGROUND ~~~~~~~~~~~
 
-                let num_bytes = full_width * full_height * 4;
+        let num_bytes = self.width * self.height * BYTES_PER_COL;
 
-                let mut pixels = match disposal_method {
-                    DISPOSAL_UNSPECIFIED => {
-                        vec![0; num_bytes]
-                    }
-                    DISPOSAL_CURRENT => {
-                        frames.last().map(|frame| frame.data.clone())
-                                     .unwrap_or_else(|| vec![0; num_bytes])
-                    }
-                    DISPOSAL_BG => {
-                        let col_idx = gct_background_color_index as usize;
-                        let color_map = gct.as_ref().unwrap();
-                        let is_transparent = transparent_index.map(|idx| idx as usize == col_idx)
-                                                              .unwrap_or(false);
-                        let (r, g, b, a) = if is_transparent {
-                            (0, 0, 0, 0)
-                        } else {
-                            let col_idx = col_idx as usize;
-                            let r = color_map[col_idx * 3 + 0];
-                            let g = color_map[col_idx * 3 + 1];
-                            let b = color_map[col_idx * 3 + 2];
-                            (r, g, b, 0xFF)
-                        };
-
-                        let mut buf = Vec::with_capacity(num_bytes);
-                        while buf.len() < num_bytes {
-                            buf.push(r);
-                            buf.push(g);
-                            buf.push(b);
-                            buf.push(a);
-                        }
-                        buf
-                    }
-                    DISPOSAL_PREVIOUS => {
-                        let num_frames = frames.len();
-                        if num_frames > 1 {
-                            frames[num_frames - 2].data.clone()
-                        } else {
-                            vec![0; num_bytes]
-                        }
-                    }
-                    _ => {
-                        return Err(Error::new(InvalidInput, "unsupported disposal method"));
-                    }
-                };
-
-                // ~~~~~~~~~~~~~~~~~~~ MAP INDICES TO COLORS ~~~~~~~~~~~~~~~~~~
-
-                let color_map = lct.as_ref().unwrap_or_else(|| gct.as_ref().unwrap());
-                for (pix_idx, col_idx) in indices.into_iter().enumerate() {
-                    let is_transparent = transparent_index.map(|idx| idx == col_idx)
-                                                          .unwrap_or(false);
-
-                    // A transparent pixel "shows through" to whatever pixels
-                    // were drawn before. True transparency can only be set
-                    // in the disposal phase, as far as I can tell.
-                    if is_transparent { continue; }
-
+        let mut pixels = match self.disposal_method {
+            // Firefox says unspecified == current
+            DISPOSAL_UNSPECIFIED | DISPOSAL_CURRENT => {
+                self.frames.last().map(|frame| frame.data.clone())
+                             .unwrap_or_else(|| vec![0; num_bytes])
+            }
+            DISPOSAL_BG => {
+                vec![0; num_bytes]
+                /*
+                println!("BG disposal {}", self.gct_bg);
+                let col_idx = self.gct_bg as usize;
+                let color_map = self.gct.as_ref().unwrap();
+                let is_transparent = transparent_index.map(|idx| idx as usize == col_idx)
+                                                      .unwrap_or(false);
+                let (r, g, b, a) = if is_transparent {
+                    (0, 0, 0, 0)
+                } else {
                     let col_idx = col_idx as usize;
                     let r = color_map[col_idx * 3 + 0];
                     let g = color_map[col_idx * 3 + 1];
                     let b = color_map[col_idx * 3 + 2];
-                    let a = 0xFF;
+                    (r, g, b, 0xFF)
+                };
 
-                    // we're blitting this frame on top of some perhaps larger
-                    // canvas. We need to adjust accordingly.
-                    let pix_idx = x + y * full_width +
-                        if width == full_width {
-                            pix_idx
-                        } else {
-                            let row = pix_idx / width;
-                            let col = pix_idx % width;
-                            row * full_width + col
-                        };
-                    pixels[pix_idx * 4 + 0] = r;
-                    pixels[pix_idx * 4 + 1] = g;
-                    pixels[pix_idx * 4 + 2] = b;
-                    pixels[pix_idx * 4 + 3] = a;
+                let mut buf = Vec::with_capacity(num_bytes);
+                while buf.len() < num_bytes {
+                    buf.push(r);
+                    buf.push(g);
+                    buf.push(b);
+                    buf.push(a);
                 }
-
-                // ~~~~~~~~~~~~~~~~~~ DONE!!! ~~~~~~~~~~~~~~~~~~~~
-
-                frames.push(Frame {
-                    data: pixels,
-                    duration: frame_delay,
-                });
-
-                // Reset frame-locals
-                transparent_index = None;
-                frame_delay = 0;
-                disposal_method = 0;
+                buf
+                */
+            }
+            DISPOSAL_PREVIOUS => {
+                let num_frames = self.frames.len();
+                if num_frames > 1 {
+                    self.frames[num_frames - 2].data.clone()
+                } else {
+                    vec![0; num_bytes]
+                }
             }
             _ => {
-                return Err(Error::new(InvalidInput, "unknown block found"));
+                // unsupported disposal method
+                return Err(Error::Malformed);
+            }
+        };
+
+        // ~~~~~~~~~~~~~~~~~~~ MAP INDICES TO COLORS ~~~~~~~~~~~~~~~~~~
+        {
+            let color_map = lct.unwrap_or_else(|| &**self.gct.as_ref().unwrap());
+            for (pix_idx, col_idx) in indices.into_iter().enumerate() {
+                let is_transparent = self
+                                         .transparent_index.map(|idx| idx == col_idx)
+                                         .unwrap_or(false);
+
+                // A transparent pixel "shows through" to whatever pixels
+                // were drawn before. True transparency can only be set
+                // in the disposal phase, as far as I can tell.
+                if is_transparent { continue; }
+
+                let col_idx = col_idx as usize;
+                let r = color_map[col_idx * 3 + 0];
+                let g = color_map[col_idx * 3 + 1];
+                let b = color_map[col_idx * 3 + 2];
+                let a = 0xFF;
+
+                // we're blitting this frame on top of some perhaps larger
+                // canvas. We need to adjust accordingly.
+                let pix_idx = x + y * self.width +
+                    if width == self.width {
+                        pix_idx
+                    } else {
+                        let row = pix_idx / width;
+                        let col = pix_idx % width;
+                        row * self.width + col
+                    };
+                pixels[pix_idx * BYTES_PER_COL + 0] = r;
+                pixels[pix_idx * BYTES_PER_COL + 1] = g;
+                pixels[pix_idx * BYTES_PER_COL + 2] = b;
+                pixels[pix_idx * BYTES_PER_COL + 3] = a;
             }
         }
+        // ~~~~~~~~~~~~~~~~~~ DONE!!! ~~~~~~~~~~~~~~~~~~~~
+
+        let time = self.frames.last()
+                              .map(|frame| frame.time + frame.duration)
+                              .unwrap_or(0);
+        self.frames.push(Frame {
+            data: pixels,
+            duration: self.frame_delay as u32,
+            time: time,
+        });
+
+        self.save_stream_position();
+
+        // reset the parse state
+        self.transparent_index = None;
+        self.disposal_method = 0;
+        self.frame_delay = 0;
+        self.parsing_metadata = true;
+
+        Ok(())
     }
 }
+
+
 
 
 // ~~~~~~~~~~~~~~~~~ utilities for decoding LZW data ~~~~~~~~~~~~~~~~~~~
@@ -404,7 +504,8 @@ const LZ_BITS: usize = 12;
 
 const NO_SUCH_CODE: usize = 4098;    // Impossible code, to signal empty.
 
-struct ParseState {
+// Stuff used in LZW decoding
+struct LzwParseState {
     bits_per_pixel: usize,
     clear_code: usize,
     eof_code: usize,
@@ -422,11 +523,11 @@ struct ParseState {
     prefix: [usize; LZ_MAX_CODE + 1],
 }
 
-fn create_parse_state(code_size: u8, pixel_count: usize) -> ParseState {
+fn create_lzw_parse_state(code_size: u8, pixel_count: usize) -> LzwParseState {
     let bits_per_pixel = code_size as usize;
     let clear_code = 1 << bits_per_pixel;
 
-    ParseState {
+    LzwParseState {
         buf: [0; 256], // giflib only inits the first byte to 0
         bits_per_pixel: bits_per_pixel,
         clear_code: clear_code,
@@ -445,11 +546,16 @@ fn create_parse_state(code_size: u8, pixel_count: usize) -> ParseState {
     }
 }
 
-fn get_indices<R: Read>(state: &mut ParseState, indices: &mut[u8], index_count: usize, data: &mut R)
-        -> IoResult<()> {
+fn get_indices<R: Read>(state: &mut LzwParseState,
+                        indices: &mut[u8],
+                        index_count: usize,
+                        data: &mut R)
+    -> GifResult<()>
+{
     state.pixel_count -= index_count;
     if state.pixel_count > 0xffff0000 {
-        return Err(Error::new(InvalidInput, "Gif has too much pixel data"));
+        // Too much pixel data
+        return Err(Error::Malformed);
     }
 
     try!(decompress_indices(state, indices, index_count, data));
@@ -463,11 +569,15 @@ fn get_indices<R: Read>(state: &mut ParseState, indices: &mut[u8], index_count: 
     Ok(())
 }
 
-fn decompress_indices<R: Read>(state: &mut ParseState, indices: &mut[u8], index_count: usize, data: &mut R)
-        -> IoResult<()> {
+fn decompress_indices<R: Read>(state: &mut LzwParseState,
+                              indices: &mut[u8],
+                              index_count: usize,
+                              data: &mut R)
+    -> GifResult<()>
+{
     let mut i = 0;
     let mut current_prefix; // This is uninit in dgif
-    let &mut ParseState {
+    let &mut LzwParseState {
         mut stack_ptr,
         eof_code,
         clear_code,
@@ -475,7 +585,7 @@ fn decompress_indices<R: Read>(state: &mut ParseState, indices: &mut[u8], index_
         ..
     } = state;
 
-    if stack_ptr > LZ_MAX_CODE { return Err(malformed()); }
+    if stack_ptr > LZ_MAX_CODE { return Err(Error::Malformed); }
     while stack_ptr != 0 && i < index_count {
         stack_ptr -= 1;
         indices[i] = state.stack[stack_ptr];
@@ -485,14 +595,14 @@ fn decompress_indices<R: Read>(state: &mut ParseState, indices: &mut[u8], index_
     while i < index_count {
         let current_code = try!(decompress_input(state, data));
 
-        let &mut ParseState {
+        let &mut LzwParseState {
             ref mut prefix,
             ref mut suffix,
             ref mut stack,
             ..
         } = state;
 
-        if current_code == eof_code { return Err(eof()); }
+        if current_code == eof_code { return Err(Error::Malformed); }
 
         if current_code == clear_code {
             // Reset all the sweet codez we learned
@@ -541,7 +651,7 @@ fn decompress_indices<R: Read>(state: &mut ParseState, indices: &mut[u8], index_
                 }
 
                 if stack_ptr >= LZ_MAX_CODE || current_prefix > LZ_MAX_CODE {
-                    return Err(malformed());
+                    return Err(Error::Malformed);
                 }
 
                 stack[stack_ptr] = current_prefix as u8;
@@ -592,7 +702,7 @@ fn get_prefix_char(prefix: &[usize], mut code: usize, clear_code: usize) -> u8 {
     code as u8
 }
 
-fn decompress_input<R: Read>(state: &mut ParseState, src: &mut R) -> IoResult<usize> {
+fn decompress_input<R: Read>(state: &mut LzwParseState, src: &mut R) -> GifResult<usize> {
     let code_masks: [usize; 13] = [
         0x0000, 0x0001, 0x0003, 0x0007,
         0x000f, 0x001f, 0x003f, 0x007f,
@@ -600,7 +710,7 @@ fn decompress_input<R: Read>(state: &mut ParseState, src: &mut R) -> IoResult<us
         0x0fff
     ];
 
-    if state.running_bits > LZ_BITS { return Err(malformed()) }
+    if state.running_bits > LZ_BITS { return Err(Error::Malformed) }
 
     while state.current_shift_state < state.running_bits {
         // Get the next byte, which is either in this block or the next one
@@ -611,7 +721,7 @@ fn decompress_input<R: Read>(state: &mut ParseState, src: &mut R) -> IoResult<us
             state.buf[0] = len as u8;
 
             // Reaching the end is not expected here
-            if len == 0 { return Err(eof()); }
+            if len == 0 { return Err(Error::Malformed); }
 
             let next_byte = state.buf[1];
             state.buf[1] = 2;
@@ -648,21 +758,21 @@ fn decompress_input<R: Read>(state: &mut ParseState, src: &mut R) -> IoResult<us
 
 // ~~~~~~~~~~~~ Streaming reading utils ~~~~~~~~~~~~~~~
 
-fn read_byte<R: Read>(reader: &mut R) -> IoResult<u8> {
+fn read_byte<R: Read>(reader: &mut R) -> GifResult<u8> {
     let mut buf = [0];
     let bytes_read = try!(reader.read(&mut buf));
-    if bytes_read != 1 { return Err(eof()); }
+    if bytes_read != 1 { return Err(Error::EndOfFile); }
     Ok(buf[0])
 }
 
-fn read_to_full<R: Read>(reader: &mut R, buf: &mut [u8]) -> IoResult<()> {
+fn read_to_full<R: Read>(reader: &mut R, buf: &mut [u8]) -> GifResult<()> {
     let mut read = 0;
     loop {
         if read == buf.len() { return Ok(()) }
 
         let bytes = try!(reader.read(&mut buf[read..]));
 
-        if bytes == 0 { return Err(eof()) }
+        if bytes == 0 { return Err(Error::EndOfFile) }
 
         read += bytes;
     }
@@ -670,7 +780,7 @@ fn read_to_full<R: Read>(reader: &mut R, buf: &mut [u8]) -> IoResult<()> {
 
 /// A few places where you need to skip through some variable length region
 /// without evaluating the results. This does that.
-fn skip_blocks<R: Read>(reader: &mut R) -> IoResult<()> {
+fn skip_blocks<R: Read>(reader: &mut R) -> GifResult<()> {
     let mut black_hole = [0; 255];
     loop {
         let len = try!(read_block(reader, &mut black_hole));
@@ -681,7 +791,7 @@ fn skip_blocks<R: Read>(reader: &mut R) -> IoResult<()> {
 /// There are several variable length encoded regions in a GIF,
 /// that look like [len, ..len]. This is a convenience for grabbing the next
 /// block. Returns `len`.
-fn read_block<R: Read>(reader: &mut R, buf: &mut [u8]) -> IoResult<usize> {
+fn read_block<R: Read>(reader: &mut R, buf: &mut [u8]) -> GifResult<usize> {
     debug_assert!(buf.len() >= 255);
     let len = try!(read_byte(reader)) as usize;
     if len == 0 { return Ok(0) } // read_to_full will probably freak out
@@ -691,12 +801,4 @@ fn read_block<R: Read>(reader: &mut R, buf: &mut [u8]) -> IoResult<usize> {
 
 fn le_u16(first: u8, second: u8) -> u16 {
     ((second as u16) << 8) | (first as u16)
-}
-
-fn malformed() -> Error {
-    Error::new(InvalidInput, "Malformed GIF")
-}
-
-fn eof() -> Error {
-    Error::new(InvalidInput, "Unexpected end of GIF")
 }

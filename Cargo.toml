@@ -2,3 +2,11 @@
 name = "gif"
 version = "0.1.0"
 authors = ["Alexis Beingessner <a.beingessner@gmail.com>"]
+
+[dependencies]
+byteorder = "*"
+
+[[test]]
+name = "reftest"
+path = "tests/reftest.rs"
+harness = false
