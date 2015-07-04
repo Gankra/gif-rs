@@ -244,11 +244,11 @@ impl<R: Read + Seek> Gif<R> {
     #[inline] pub fn height(&self) -> u32 { self.height as u32 }
 
     fn save_stream_position(&mut self) {
-        //self.stream_pos = self.data.seek(SeekFrom::Current(0)).unwrap();
+        self.stream_pos = self.data.seek(SeekFrom::Current(0)).unwrap();
     }
 
     fn load_stream_position(&mut self) {
-        //self.data.seek(SeekFrom::Start(self.stream_pos)).unwrap();
+        self.data.seek(SeekFrom::Start(self.stream_pos)).unwrap();
     }
 
     /// Reads more of the stream until an entire new frame has been computed.
