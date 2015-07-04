@@ -1,9 +1,9 @@
-#![feature(exit_status, path_ext)]
+#![feature(path_ext)]
 
 extern crate gif;
 extern crate byteorder;
 
-use std::env;
+use std::process;
 use std::fs::{self, PathExt, File};
 use std::io::{Read, Write, Error};
 use std::io::Result as IoResult;
@@ -22,12 +22,12 @@ pub fn main() {
                 println!("all tests passed");
             } else {
                 println!("some tests failed");
-                env::set_exit_status(1)
+                process::exit(1);
             }
         }
         Err(err) => {
             println!("Unexpected I/O error: {}", err);
-            env::set_exit_status(2)
+            process::exit(2);
         }
     }
 }
