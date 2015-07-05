@@ -54,6 +54,14 @@ fn do_it() -> IoResult<(u32, u32)> {
             }
             let mut gif = gif.ok().unwrap();
 
+            let width = gif.width();
+            let height = gif.height();
+
+            let mut prev_frame = vec![0; gif.frame_size()];
+            let mut cur_frame = vec![0; gif.frame_size()];
+
+            let mut gif_view = gif.view();
+
             let mut outputs = vec![];
             for entry in try!(fs::read_dir(&dir_path)) {
                 let entry = try!(entry);
@@ -67,16 +75,17 @@ fn do_it() -> IoResult<(u32, u32)> {
                 let output = try!(File::open(output));
                 let ref_frame = try!(parse_tga(output));
 
-                if let Err(err) = gif.parse_next_frame() {
-                    println!("  Test failed -- could not decode frame {}", frame_no);
-                    println!("{:?}", err);
-                    continue 'main;
+                match gif_view.get_next_frame(&mut prev_frame, &cur_frame) {
+                    Ok(true) => {}
+                    Ok(false) | Err(_) => {
+                        println!("  Test failed -- unexpected end of GIF at frame {}", frame_no);
+                        continue 'main;
+                    }
                 }
 
-                let frame = gif.get_frame(frame_no);
-                let width = gif.width();
-                let height = gif.height();
-                let data = &frame.data;
+                ::std::mem::swap(&mut prev_frame, &mut cur_frame);
+
+                let data = &cur_frame;
 
                 if ref_frame.width != width || ref_frame.height != height {
                     println!("  Test failed -- incorrect dimensions of frame {}", frame_no);
@@ -109,8 +118,16 @@ fn do_it() -> IoResult<(u32, u32)> {
                     }
                 }
             }
-            // If we didn't `continue` then the test passed
-            passed += 1;
+
+            if let Ok(false) = gif_view.get_next_frame(&mut prev_frame, &cur_frame) {
+                // If we didn't `continue` then the test passed
+                passed += 1;
+            } else {
+                println!("  Test failed -- GIF has too many frames");
+                continue 'main;
+            }
+
+
         }
     }
     Ok((passed, run))

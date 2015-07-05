@@ -131,31 +131,47 @@ const DISPOSAL_PREVIOUS: u8 = 3;
 const BYTES_PER_COL: usize = 4;
 
 pub struct Gif<R> {
-    pub width: usize,
-    pub height: usize,
+    width: u16,
+    height: u16,
+
     /// Defaults to 1, but at some point we may discover a new value.
     /// Presumably this should only happen once.
-    pub num_iterations: u16,
-    pub frames: Vec<Frame>,
+    num_iterations: u16,
+    frames: Vec<Frame>,
+    animated: bool,
+    fully_parsed: bool,
+
     gct_bg: usize,
     gct: Option<Box<[u8; MAX_COLOR_TABLE_SIZE]>>,
     data: R,
-    image_parse_state: Option<Box<LzwParseState>>,
+    parse_state: Option<Box<LzwParseState>>,
     stream_pos: u64,
-
-    // where we are
-    parsing_metadata: bool,
-
-    // info we *might* find while parsing metadata
-    transparent_index: Option<u8>,
-    frame_delay: u16,
-    disposal_method: u8,
 }
 
 pub struct Frame {
-    pub time: u32,
-    pub duration: u32,
-    pub data: Vec<u8>
+    time: u32,
+    duration: u32,
+    stream_pos: u64,
+    is_key: bool,
+    parse_state: ParseState,
+
+    // info we *might* find while parsing metadata
+    transparent_index: Option<u8>,
+    disposal_method: u8,
+
+    x: u16,
+    y: u16,
+    width: u16,
+    height: u16,
+    interlace: bool,
+    lct: Option<Box<[u8; MAX_COLOR_TABLE_SIZE]>>,
+
+    indices: Option<Box<[u8]>>, // len = width * height
+}
+
+pub struct GifView<'a, R: 'a> {
+    gif: &'a mut Gif<R>,
+    current_frame: usize,
 }
 
 #[derive(Debug)]
@@ -165,11 +181,95 @@ pub enum Error {
     EndOfFile,
 }
 
+enum ParseState {
+    Fresh,
+    ExtensionsParsed,
+    MetadataParsed,
+    Parsed,
+}
+
 impl From<IoError> for Error {
     fn from(_: IoError) -> Error { Error::IoError }
 }
 
 pub type GifResult<T> = Result<T, Error>;
+
+
+impl Frame {
+    fn new(time: u32) -> Frame {
+        Frame {
+            time: time,
+            duration: 0,
+            stream_pos: 0,
+            is_key: false,
+            parse_state: ParseState::Fresh,
+
+            transparent_index: None,
+            disposal_method: 0,
+
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+            interlace: false,
+            lct: None,
+
+            indices: None,
+        }
+    }
+
+    #[inline] pub fn time(&self) -> u32 { self.time }
+    #[inline] pub fn duration(&self) -> u32 { self.duration }
+}
+
+impl <'a, R: Read + Seek> GifView<'a, R> {
+    /// Takes two buffers of bytes: the current frame and the previous frame.
+    ///
+    /// To allow the user of the library to do their own memory management, this API
+    /// requires that the memory for the frames be passed in. In order to correctly
+    /// render the *next* GIF frame, it is necessary that the pixels of the current
+    /// and previous frame be available. The previous frame will subsequently be
+    /// overwritten with the next frame's pixels.
+    ///
+    /// If this is the first frame to be rendered, the current_frame can be
+    /// empty. Otherwise, both frames should have the size returned by `frame_size`
+    /// (this value is a constant for any given Gif).
+    pub fn get_next_frame(&mut self, prev_frame: &mut[u8], current_frame: &[u8])
+        -> GifResult<bool>
+    {
+        loop {
+            match self.gif.frames[self.current_frame].parse_state {
+                ParseState::Fresh => {
+                    let has_next_frame = try!(self.gif.parse_extension_blocks());
+                    if !has_next_frame { return Ok(false); }
+                }
+                ParseState::ExtensionsParsed => {
+                    try!(self.gif.parse_image_block_header());
+                }
+                ParseState::MetadataParsed => {
+                    try!(self.gif.parse_indices());
+                }
+                ParseState::Parsed => {
+                    try!(self.gif.decode_indices(prev_frame,
+                                                 current_frame,
+                                                 &self.gif.frames[self.current_frame]));
+                    self.current_frame += 1;
+                    return Ok(true);
+                }
+            }
+        }
+    }
+
+    /// Seeks to the first keyframe before (inclusive) the given time in 100ths
+    /// of a second. At this point the user of the library needs to start calling
+    /// get_next_frame until they reach the desired time.
+    ///
+    /// WIP
+    #[inline]
+    pub fn seek_before(&mut self, time: u32) -> Result<u32, ()> {
+        unimplemented!();
+    }
+}
 
 impl<R: Read + Seek> Gif<R> {
     /// Interpret the given Reader as an entire Gif file. Parses out the
@@ -177,7 +277,7 @@ impl<R: Read + Seek> Gif<R> {
     ///
     /// Returns an Error if the stream isn't long enough to get the whole
     /// header in one shot.
-    pub fn new (mut data: R) -> GifResult<Gif<R>> {
+    pub fn new(mut data: R) -> GifResult<Gif<R>> {
 
         // ~~~~~~~~~ Image Prelude ~~~~~~~~~~
         let mut buf = [0; HEADER_LEN + GLOBAL_DESCRIPTOR_LEN];
@@ -206,42 +306,55 @@ impl<R: Read + Seek> Gif<R> {
         };
 
         let mut gif = Gif {
-            width: full_width as usize,
-            height: full_height as usize,
-            num_iterations: 1, // This may be changed as we parse more
+            width: full_width,
+            height: full_height,
+
+            // This may be changed as we parse more
+            num_iterations: 1,
+            animated: false,
+
             frames: vec![],
             gct_bg: gct_background_color_index,
             gct: gct,
             data: data,
-            image_parse_state: None,
+            parse_state: None,
+            fully_parsed: false,
             stream_pos: 0,
-            parsing_metadata: true,
-
-            transparent_index: None,
-            frame_delay: 0,
-            disposal_method: 0,
         };
 
         gif.save_stream_position();
-        try!(gif.parse_metadata_blocks());
+        gif.frames.push(Frame::new(0));
+        try!(gif.parse_extension_blocks());
 
         Ok(gif)
     }
 
-    pub fn parse_next_frame(&mut self) -> GifResult<bool> {
-        if self.parsing_metadata {
-            let has_next_frame = try!(self.parse_metadata_blocks());
-            if !has_next_frame { return Ok(false) }
-        }
-
-        try!(self.parse_image_block());
-
-        Ok(true)
+    pub fn view(&mut self) -> GifView<R> {
+        GifView { gif: self, current_frame: 0, }
     }
 
-    #[inline] pub fn get_frame(&self, idx: usize) -> &Frame { &self.frames[idx] }
     #[inline] pub fn width(&self) -> u32 { self.width as u32 }
     #[inline] pub fn height(&self) -> u32 { self.height as u32 }
+    #[inline] pub fn is_animated(&self) -> bool { self.animated }
+    #[inline] pub fn num_iterations(&self) -> u16 { self.num_iterations }
+    #[inline] pub fn is_transparent(&self) -> bool { true }
+    #[inline] pub fn frame_size(&self) -> usize { self.width as usize * self.height as usize * 4 }
+
+    /// Gets the duration of the whole GIF in 100ths of a second.
+    ///
+    /// This is a value that cannot be known until the entire GIF has been
+    /// read. As such, while the gif hasn't been fully parsed, this is just
+    /// a lower bound. If the gif is not animated, the value is 0.
+    #[inline]
+    pub fn duration(&self) -> u32 {
+        self.frames.last()
+                   .map(|frame| frame.time + frame.duration)
+                   .unwrap_or(0)
+    }
+
+    fn last_frame(&mut self) -> &mut Frame {
+        self.frames.last_mut().unwrap()
+    }
 
     fn save_stream_position(&mut self) {
         self.stream_pos = self.data.seek(SeekFrom::Current(0)).unwrap();
@@ -253,12 +366,15 @@ impl<R: Read + Seek> Gif<R> {
 
     /// Reads more of the stream until an entire new frame has been computed.
     /// Returns `false` if the file ends, and `true` otherwise.
-    fn parse_metadata_blocks(&mut self) -> GifResult<bool> {
+    fn parse_extension_blocks(&mut self) -> GifResult<bool> {
         self.load_stream_position();
 
         loop {
             match try!(read_byte(&mut self.data)) {
                 BLOCK_EOF => {
+                    self.frames.pop();
+                    self.fully_parsed = true;
+                    self.parse_state = None; // free up the memory (it's several KB)
                     return Ok(false)
                 }
                 BLOCK_EXTENSION => {
@@ -276,12 +392,16 @@ impl<R: Read + Seek> Gif<R> {
                             let rendering_mega_field = ext[1];
                             let transparency_flag = (rendering_mega_field & 0b0000_0001) != 0;
 
-                            self.disposal_method =
+                            self.animated = true;
+
+                            let last_frame = self.last_frame();
+
+                            last_frame.disposal_method =
                                 (rendering_mega_field & 0b0001_1100) >> 2;
 
-                            self.frame_delay = le_u16(ext[2], ext[3]);
+                            last_frame.duration = le_u16(ext[2], ext[3]) as u32;
 
-                            self.transparent_index = if transparency_flag {
+                            last_frame.transparent_index = if transparency_flag {
                                 Some(ext[4])
                             } else {
                                 None
@@ -305,7 +425,7 @@ impl<R: Read + Seek> Gif<R> {
                     self.save_stream_position();
                 }
                 BLOCK_IMAGE => {
-                    self.parsing_metadata = false;
+                    self.last_frame().parse_state = ParseState::ExtensionsParsed;
                     self.save_stream_position();
                     return Ok(true)
                 }
@@ -317,85 +437,128 @@ impl<R: Read + Seek> Gif<R> {
         }
     }
 
-    fn parse_image_block(&mut self) -> GifResult<()> {
+    fn parse_image_block_header(&mut self) -> GifResult<()> {
         self.load_stream_position();
 
-        let mut descriptor = [0; LOCAL_DESCRIPTOR_LEN];
-        try!(read_to_full(&mut self.data, &mut descriptor));
+        // new scope to toss frame before save_stream_position
+        {
+            let frame = self.frames.last_mut().unwrap();
 
-        let x      = le_u16(descriptor[0], descriptor[1]) as usize;
-        let y      = le_u16(descriptor[2], descriptor[3]) as usize;
-        let width  = le_u16(descriptor[4], descriptor[5]) as usize;
-        let height = le_u16(descriptor[6], descriptor[7]) as usize;
-
-        let lct_mega_field = descriptor[8];
-        let lct_flag = (lct_mega_field & 0b1000_0000) != 0;
-        let interlace = (lct_mega_field & 0b0100_0000) != 0;
-        let lct_size_exponent = (lct_mega_field & 0b0000_1110) >> 1;
-        let lct_size = 1usize << (lct_size_exponent + 1); // 2^(k+1)
+            let mut descriptor = [0; LOCAL_DESCRIPTOR_LEN];
+            try!(read_to_full(&mut self.data, &mut descriptor));
 
 
-        let mut lct_buf = [0; MAX_COLOR_TABLE_SIZE];
+            frame.x      = le_u16(descriptor[0], descriptor[1]);
+            frame.y      = le_u16(descriptor[2], descriptor[3]);
+            frame.width  = le_u16(descriptor[4], descriptor[5]);
+            frame.height = le_u16(descriptor[6], descriptor[7]);
 
-        let lct = if lct_flag {
-            let lct = &mut lct_buf[.. 3 * lct_size];
-            try!(read_to_full(&mut self.data, lct));
-            Some(&*lct)
-        } else {
-            None
-        };
+            let num_indices = frame.width as usize * frame.height as usize;
 
-        let minimum_code_size = try!(read_byte(&mut self.data));
+            let lct_mega_field = descriptor[8];
+            let lct_flag = (lct_mega_field & 0b1000_0000) != 0;
+            frame.interlace = (lct_mega_field & 0b0100_0000) != 0;
+            let lct_size_exponent = (lct_mega_field & 0b0000_1110) >> 1;
+            let lct_size = 1usize << (lct_size_exponent + 1); // 2^(k+1)
 
-        let mut indices = vec![0; width * height]; //TODO: not this
-
-        /* For debugging
-        println!("");
-        println!("starting frame decoding: {}", self.frames.len());
-        println!("x: {}, y: {}, w: {}, h: {}", x, y, width, height);
-        println!("trans: {:?}, interlace: {}", transparent_index, interlace);
-        println!("delay: {}, disposal: {}, iters: {:?}",
-                 frame_delay, disposal_method, self.num_iterations);
-        println!("lct: {}, gct: {}", lct_flag, self.gct.is_some());
-        */
-
-        // ~~~~~~~~~~~~~~ DECODE THE INDICES ~~~~~~~~~~~~~~~~
-
-        let mut parse_state = create_lzw_parse_state(minimum_code_size, width * height);
-
-        if interlace {
-            let interlaced_offset = [0, 4, 2, 1];
-            let interlaced_jumps = [8, 8, 4, 2];
-            for i in 0..4 {
-                let mut j = interlaced_offset[i];
-                while j < height {
-                    try!(get_indices(&mut parse_state,
-                                     &mut indices[j * width..],
-                                     width,
-                                     &mut self.data));
-
-                    j += interlaced_jumps[i];
+            frame.lct = if lct_flag {
+                let mut lct_buf = Box::new([0; MAX_COLOR_TABLE_SIZE]);
+                {
+                    let lct = &mut lct_buf[.. 3 * lct_size];
+                    try!(read_to_full(&mut self.data, lct));
                 }
-            }
-        } else {
-            try!(get_indices(&mut parse_state,
-                             &mut indices,
-                             width * height,
-                             &mut self.data));
+                Some(lct_buf)
+            } else {
+                None
+            };
+
+            let minimum_code_size = try!(read_byte(&mut self.data));
+
+            /* For debugging
+            println!("");
+            println!("starting frame decoding: {}", self.frames.len());
+            println!("x: {}, y: {}, w: {}, h: {}", x, y, width, height);
+            println!("trans: {:?}, interlace: {}", transparent_index, interlace);
+            println!("delay: {}, disposal: {}, iters: {:?}",
+                     frame_delay, disposal_method, self.num_iterations);
+            println!("lct: {}, gct: {}", lct_flag, self.gct.is_some());
+            */
+
+            self.parse_state = Some(Box::new(create_lzw_parse_state(minimum_code_size,
+                                                                    num_indices)));
+
+            frame.indices = Some(vec![0; num_indices].into_boxed_slice());
+            frame.parse_state = ParseState::MetadataParsed;
         }
 
+        self.save_stream_position();
+        Ok(())
+    }
+
+    fn parse_indices(&mut self) -> GifResult<()> {
+        self.load_stream_position();
+        {
+            let frame = self.frames.last_mut().unwrap();
+            let frame_width = frame.width as usize;
+            let frame_height = frame.height as usize;
+            if frame.interlace {
+                let interlaced_offset = [0, 4, 2, 1];
+                let interlaced_jumps = [8, 8, 4, 2];
+                for i in 0..4 {
+                    let mut j = interlaced_offset[i];
+                    while j < frame_height {
+                        try!(get_indices(self.parse_state.as_mut().unwrap(),
+                                         &mut frame.indices.as_mut().unwrap()[j * frame_width..],
+                                         frame_width,
+                                         &mut self.data));
+
+                        j += interlaced_jumps[i];
+                    }
+                }
+            } else {
+                try!(get_indices(self.parse_state.as_mut().unwrap(),
+                                 &mut frame.indices.as_mut().unwrap(),
+                                 frame_width * frame_height,
+                                 &mut self.data));
+            }
+            frame.parse_state = ParseState::Parsed;
+        }
+
+        let frame_time = self.frames.get(self.frames.len() - 2)
+                                                    .map(|frame| frame.time + frame.duration)
+                                                    .unwrap_or(0);
+
+        self.frames.push(Frame::new(frame_time));
+
+        // TODO: save state more granularly
+        self.save_stream_position();
+        Ok(())
+    }
+
+    fn decode_indices(&self,
+                      prev_frame_data: &mut [u8],
+                      cur_frame_data: &[u8],
+                      next_frame: &Frame)
+        -> GifResult<()>
+    {
         // ~~~~~~~~~~~~~~ INITIALIZE THE BACKGROUND ~~~~~~~~~~~
 
-        let num_bytes = self.width * self.height * BYTES_PER_COL;
+        let num_bytes = next_frame.width as usize * next_frame.height as usize * BYTES_PER_COL;
 
-        let mut pixels = match self.disposal_method {
+        match next_frame.disposal_method {
             // Firefox says unspecified == current
             DISPOSAL_UNSPECIFIED | DISPOSAL_CURRENT => {
-                self.frames.last().map(|frame| frame.data.clone())
-                             .unwrap_or_else(|| vec![0; num_bytes])
+                if cur_frame_data.is_empty() {
+                    for byte in prev_frame_data.iter_mut() { *byte = 0 }
+                } else {
+                    for (output, input) in prev_frame_data.iter_mut().zip(cur_frame_data.iter()) {
+                        *output = *input
+                    }
+                }
             }
             DISPOSAL_BG => {
-                vec![0; num_bytes]
+                // Seems like Firefox just does this?
+                for byte in prev_frame_data.iter_mut() { *byte = 0 }
                 /*
                 println!("BG disposal {}", self.gct_bg);
                 let col_idx = self.gct_bg as usize;
@@ -422,27 +585,25 @@ impl<R: Read + Seek> Gif<R> {
                 buf
                 */
             }
-            DISPOSAL_PREVIOUS => {
-                let num_frames = self.frames.len();
-                if num_frames > 1 {
-                    self.frames[num_frames - 2].data.clone()
-                } else {
-                    vec![0; num_bytes]
-                }
-            }
+            DISPOSAL_PREVIOUS => { /* no-op yay */ }
             _ => {
                 // unsupported disposal method
                 return Err(Error::Malformed);
             }
         };
 
+        // nicer name
+        let pixels = prev_frame_data;
+
         // ~~~~~~~~~~~~~~~~~~~ MAP INDICES TO COLORS ~~~~~~~~~~~~~~~~~~
         {
-            let color_map = lct.unwrap_or_else(|| &**self.gct.as_ref().unwrap());
-            for (pix_idx, col_idx) in indices.into_iter().enumerate() {
-                let is_transparent = self
-                                         .transparent_index.map(|idx| idx == col_idx)
-                                         .unwrap_or(false);
+            let color_map: &[u8] = next_frame.lct.as_ref()
+                                                 .map(|lct| &**lct)
+                                                 .unwrap_or_else(|| &**self.gct.as_ref().unwrap());
+
+            for (pix_idx, &col_idx) in next_frame.indices.as_ref().unwrap().iter().enumerate() {
+                let is_transparent = next_frame.transparent_index.map(|idx| idx == col_idx)
+                                                                 .unwrap_or(false);
 
                 // A transparent pixel "shows through" to whatever pixels
                 // were drawn before. True transparency can only be set
@@ -457,39 +618,24 @@ impl<R: Read + Seek> Gif<R> {
 
                 // we're blitting this frame on top of some perhaps larger
                 // canvas. We need to adjust accordingly.
-                let pix_idx = x + y * self.width +
-                    if width == self.width {
-                        pix_idx
-                    } else {
-                        let row = pix_idx / width;
-                        let col = pix_idx % width;
-                        row * self.width + col
-                    };
+                let offset = if next_frame.width == self.width {
+                    pix_idx
+                } else {
+                    let row = pix_idx / next_frame.width as usize;
+                    let col = pix_idx % next_frame.width as usize;
+                    row * self.width as usize + col
+                };
+
+                let pix_idx = next_frame.x as usize
+                            + (next_frame.y as usize * self.width as usize)
+                            + offset;
+
                 pixels[pix_idx * BYTES_PER_COL + 0] = r;
                 pixels[pix_idx * BYTES_PER_COL + 1] = g;
                 pixels[pix_idx * BYTES_PER_COL + 2] = b;
                 pixels[pix_idx * BYTES_PER_COL + 3] = a;
             }
         }
-        // ~~~~~~~~~~~~~~~~~~ DONE!!! ~~~~~~~~~~~~~~~~~~~~
-
-        let time = self.frames.last()
-                              .map(|frame| frame.time + frame.duration)
-                              .unwrap_or(0);
-        self.frames.push(Frame {
-            data: pixels,
-            duration: self.frame_delay as u32,
-            time: time,
-        });
-
-        self.save_stream_position();
-
-        // reset the parse state
-        self.transparent_index = None;
-        self.disposal_method = 0;
-        self.frame_delay = 0;
-        self.parsing_metadata = true;
-
         Ok(())
     }
 }
