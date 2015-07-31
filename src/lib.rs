@@ -151,7 +151,6 @@ pub struct Gif<R> {
 pub struct Frame {
     time: u32,
     duration: u32,
-    stream_pos: u64,
     is_key: bool,
     parse_state: ParseState,
 
@@ -200,7 +199,6 @@ impl Frame {
         Frame {
             time: time,
             duration: 0,
-            stream_pos: 0,
             is_key: false,
             parse_state: ParseState::Fresh,
 
@@ -531,7 +529,6 @@ impl<R: Read + Seek> Gif<R> {
         self.frames.push(Frame::new(frame_time));
 
         // TODO: save state more granularly
-        self.save_stream_position();
         Ok(())
     }
 
@@ -542,8 +539,6 @@ impl<R: Read + Seek> Gif<R> {
         -> GifResult<()>
     {
         // ~~~~~~~~~~~~~~ INITIALIZE THE BACKGROUND ~~~~~~~~~~~
-
-        let num_bytes = next_frame.width as usize * next_frame.height as usize * BYTES_PER_COL;
 
         match next_frame.disposal_method {
             // Firefox says unspecified == current
@@ -662,6 +657,8 @@ struct LzwParseState {
     stack_ptr: usize,
     current_shift_state: usize,
     current_shift_dword: usize,
+    current_prefix: usize,
+    i: usize, // next index to write to
     pixel_count: usize,
     buf: [u8; 256], // [0] = len, [1] = cur_index
     stack: [u8; LZ_MAX_CODE],
@@ -688,14 +685,16 @@ fn create_lzw_parse_state(code_size: u8, pixel_count: usize) -> LzwParseState {
         prefix: [NO_SUCH_CODE; LZ_MAX_CODE + 1],
         suffix: [0; LZ_MAX_CODE + 1],
         stack: [0; LZ_MAX_CODE],
+        current_prefix: 0,
+        i: 0,
         pixel_count: pixel_count,
     }
 }
 
-fn get_indices<R: Read>(state: &mut LzwParseState,
-                        indices: &mut[u8],
-                        index_count: usize,
-                        data: &mut R)
+fn get_indices<R: Read + Seek>(state: &mut LzwParseState,
+                               indices: &mut[u8],
+                               index_count: usize,
+                               data: &mut R)
     -> GifResult<()>
 {
     state.pixel_count -= index_count;
@@ -715,36 +714,37 @@ fn get_indices<R: Read>(state: &mut LzwParseState,
     Ok(())
 }
 
-fn decompress_indices<R: Read>(state: &mut LzwParseState,
-                              indices: &mut[u8],
-                              index_count: usize,
-                              data: &mut R)
+fn decompress_indices<R: Read + Seek>(state: &mut LzwParseState,
+                                      indices: &mut[u8],
+                                      index_count: usize,
+                                      data: &mut R)
     -> GifResult<()>
 {
-    let mut i = 0;
-    let mut current_prefix; // This is uninit in dgif
-    let &mut LzwParseState {
-        mut stack_ptr,
-        eof_code,
-        clear_code,
-        mut last_code,
-        ..
-    } = state;
 
-    if stack_ptr > LZ_MAX_CODE { return Err(Error::Malformed); }
-    while stack_ptr != 0 && i < index_count {
-        stack_ptr -= 1;
-        indices[i] = state.stack[stack_ptr];
-        i += 1;
+    // Only do this check on the first peek
+    if state.i != 0 {
+        if state.stack_ptr > LZ_MAX_CODE { return Err(Error::Malformed); }
+
+        while state.stack_ptr != 0 && state.i < index_count {
+            state.stack_ptr -= 1;
+            indices[state.i] = state.stack[state.stack_ptr];
+            state.i += 1;
+        }
     }
 
-    while i < index_count {
+    while state.i < index_count {
         let current_code = try!(decompress_input(state, data));
 
         let &mut LzwParseState {
+            ref mut stack_ptr,
             ref mut prefix,
             ref mut suffix,
             ref mut stack,
+            ref mut i,
+            ref mut current_prefix,
+            eof_code,
+            clear_code,
+            ref mut last_code,
             ..
         } = state;
 
@@ -759,63 +759,62 @@ fn decompress_indices<R: Read>(state: &mut LzwParseState,
             state.running_code = state.eof_code + 1;
             state.running_bits = state.bits_per_pixel + 1;
             state.max_code_1 = 1 << state.running_bits;
-            state.last_code = NO_SUCH_CODE;
-            last_code = state.last_code;
+            *last_code = NO_SUCH_CODE;
         } else {
             // Regular code
             if current_code < clear_code {
                 // single index code, direct mapping to a colour index
-                indices[i] = current_code as u8;
-                i += 1;
+                indices[*i] = current_code as u8;
+                *i += 1;
             } else {
                 // MULTI-CODE MULTI-CODE ENGAGE -- DASH DASH DASH!!!!
 
                 if prefix[current_code] == NO_SUCH_CODE {
-                    current_prefix = last_code;
+                    *current_prefix = *last_code;
 
                     let code = if current_code == state.running_code - 2 {
-                        last_code
+                        *last_code
                     } else {
                         current_code
                     };
 
                     let prefix_char = get_prefix_char(&*prefix, code, clear_code);
-                    stack[stack_ptr] = prefix_char;
+                    stack[*stack_ptr] = prefix_char;
                     suffix[state.running_code - 2] = prefix_char;
-                    stack_ptr += 1;
+                    *stack_ptr += 1;
                 } else {
-                    current_prefix = current_code;
+                    *current_prefix = current_code;
                 }
 
-                while stack_ptr < LZ_MAX_CODE
-                        && current_prefix > clear_code
-                        && current_prefix <= LZ_MAX_CODE {
+                while *stack_ptr < LZ_MAX_CODE
+                        && *current_prefix > clear_code
+                        && *current_prefix <= LZ_MAX_CODE {
 
-                    stack[stack_ptr] = suffix[current_prefix];
-                    stack_ptr += 1;
-                    current_prefix = prefix[current_prefix];
+                    stack[*stack_ptr] = suffix[*current_prefix];
+                    *stack_ptr += 1;
+                    *current_prefix = prefix[*current_prefix];
                 }
 
-                if stack_ptr >= LZ_MAX_CODE || current_prefix > LZ_MAX_CODE {
+                if *stack_ptr >= LZ_MAX_CODE || *current_prefix > LZ_MAX_CODE {
                     return Err(Error::Malformed);
                 }
 
-                stack[stack_ptr] = current_prefix as u8;
-                stack_ptr += 1;
+                stack[*stack_ptr] = *current_prefix as u8;
+                *stack_ptr += 1;
 
-                while stack_ptr != 0 && i < index_count {
-                    stack_ptr -= 1;
-                    indices[i] = stack[stack_ptr];
-                    i += 1;
+                while *stack_ptr != 0 && *i < index_count {
+                    *stack_ptr -= 1;
+                    indices[*i] = stack[*stack_ptr];
+                    *i += 1;
                 }
 
             }
 
-            if last_code != NO_SUCH_CODE && prefix[state.running_code - 2] == NO_SUCH_CODE {
-                prefix[state.running_code - 2] = last_code;
+            if *last_code != NO_SUCH_CODE && prefix[state.running_code - 2] == NO_SUCH_CODE {
+                prefix[state.running_code - 2] = *last_code;
 
                 let code = if current_code == state.running_code - 2 {
-                    last_code
+                    *last_code
                 } else {
                     current_code
                 };
@@ -823,12 +822,11 @@ fn decompress_indices<R: Read>(state: &mut LzwParseState,
                 suffix[state.running_code - 2] = get_prefix_char(&*prefix, code, clear_code);
             }
 
-            last_code = current_code;
+            *last_code = current_code;
         }
     }
 
-    state.last_code = last_code;
-    state.stack_ptr = stack_ptr;
+    state.i = 0;
 
     Ok(())
 }
@@ -848,7 +846,7 @@ fn get_prefix_char(prefix: &[usize], mut code: usize, clear_code: usize) -> u8 {
     code as u8
 }
 
-fn decompress_input<R: Read>(state: &mut LzwParseState, src: &mut R) -> GifResult<usize> {
+fn decompress_input<R: Read + Seek>(state: &mut LzwParseState, src: &mut R) -> GifResult<usize> {
     let code_masks: [usize; 13] = [
         0x0000, 0x0001, 0x0003, 0x0007,
         0x000f, 0x001f, 0x003f, 0x007f,
@@ -864,6 +862,7 @@ fn decompress_input<R: Read>(state: &mut LzwParseState, src: &mut R) -> GifResul
 
             // This block is done, get the next one
             let len = try!(read_block(src, &mut state.buf[1..]));
+
             state.buf[0] = len as u8;
 
             // Reaching the end is not expected here
